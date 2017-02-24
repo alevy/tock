@@ -7,16 +7,20 @@ use kernel::hil;
 use kernel::hil::gpio::{Client, InterruptMode};
 use kernel::process::Error;
 
-pub type SubscribeMap = u32;
+#[derive(Default)]
+pub struct App {
+    callback: Option<Callback>,
+    subscribe_map: u32
+}
 
 pub struct Button<'a, G: hil::gpio::Pin + 'a> {
     pins: &'a [&'a G],
-    callback: Container<(Option<Callback>, SubscribeMap)>,
+    app: Container<App>,
 }
 
 impl<'a, G: hil::gpio::Pin + hil::gpio::PinCtl> Button<'a, G> {
     pub fn new(pins: &'a [&'a G],
-               container: Container<(Option<Callback>, SubscribeMap)>)
+               container: Container<App>)
                -> Button<'a, G> {
         // Make all pins output and off
         for (i, pin) in pins.iter().enumerate() {
@@ -26,7 +30,7 @@ impl<'a, G: hil::gpio::Pin + hil::gpio::PinCtl> Button<'a, G> {
 
         Button {
             pins: pins,
-            callback: container,
+            app: container,
         }
     }
 }
@@ -37,9 +41,9 @@ impl<'a, G: hil::gpio::Pin + hil::gpio::PinCtl> Driver for Button<'a, G> {
             // set callback for pin interrupts (no affect or reliance on individual pins being
             // configured as interrupts)
             0 => {
-                self.callback
+                self.app
                     .enter(callback.app_id(), |cntr, _| {
-                        cntr.0 = Some(callback);
+                        cntr.callback = Some(callback);
                         ReturnCode::SUCCESS
                     })
                     .unwrap_or_else(|err| match err {
@@ -62,9 +66,9 @@ impl<'a, G: hil::gpio::Pin + hil::gpio::PinCtl> Driver for Button<'a, G> {
             // enable interrupts on pin
             1 => {
                 if data < pins.len() {
-                    self.callback
+                    self.app
                         .enter(appid, |cntr, _| {
-                            cntr.1 |= 1 << data;
+                            cntr.subscribe_map |= 1 << data;
                             ReturnCode::SUCCESS
                         })
                         .unwrap_or_else(|err| match err {
@@ -83,9 +87,9 @@ impl<'a, G: hil::gpio::Pin + hil::gpio::PinCtl> Driver for Button<'a, G> {
                 if data >= pins.len() {
                     ReturnCode::EINVAL /* impossible pin */
                 } else {
-                    self.callback
+                    self.app
                         .enter(appid, |cntr, _| {
-                            cntr.1 &= !(1 << data);
+                            cntr.subscribe_map &= !(1 << data);
                             ReturnCode::SUCCESS
                         })
                         .unwrap_or_else(|err| match err {
@@ -119,10 +123,12 @@ impl<'a, G: hil::gpio::Pin> Client for Button<'a, G> {
         let pin_state = pins[pin_num].read();
 
         // schedule callback with the pin number and value
-        self.callback.each(|cntr| {
-            cntr.0.map(|mut callback| if cntr.1 & (1 << pin_num) != 0 {
-                callback.schedule(pin_num, pin_state as usize, 0);
-            });
+        self.app.each(|cntr| {
+            cntr.callback.map(|mut callback|
+                if cntr.subscribe_map & (1 << pin_num) != 0 {
+                    callback.schedule(pin_num, pin_state as usize, 0);
+                }
+            );
         });
     }
 }
