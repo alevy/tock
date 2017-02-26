@@ -4,20 +4,25 @@
 //! GPIOs are presented through a driver interface with synchronous comands
 //! and a callback for interrupts.
 
-use core::cell::Cell;
-use kernel::{AppId, Callback, Driver, ReturnCode};
+use kernel::{AppId, Callback, Container, Driver, ReturnCode};
 use kernel::hil::gpio::{Pin, PinCtl, InputMode, InterruptMode, Client};
+
+#[derive(Default)]
+pub struct App {
+    callback: Option<Callback>,
+    subscribe_map: u32
+}
 
 pub struct GPIO<'a, G: Pin + 'a> {
     pins: &'a [&'a G],
-    callback: Cell<Option<Callback>>,
+    app: Container<App>,
 }
 
 impl<'a, G: Pin + PinCtl> GPIO<'a, G> {
-    pub fn new(pins: &'a [&'a G]) -> GPIO<'a, G> {
+    pub fn new(pins: &'a [&'a G], container: Container<App>) -> GPIO<'a, G> {
         GPIO {
             pins: pins,
-            callback: Cell::new(None),
+            app: container,
         }
     }
 
@@ -74,9 +79,13 @@ impl<'a, G: Pin> Client for GPIO<'a, G> {
         let pin_state = pins[pin_num].read();
 
         // schedule callback with the pin number and value
-        if self.callback.get().is_some() {
-            self.callback.get().unwrap().schedule(pin_num, pin_state as usize, 0);
-        }
+        self.app.each(|app| {
+            app.callback.map(|mut cb| {
+                if app.subscribe_map | 1 << pin_num != 0 {
+                    cb.schedule(pin_num, pin_state as usize, 0);
+                }
+            });
+        });
     }
 }
 
@@ -84,9 +93,12 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
     fn subscribe(&self, subscribe_num: usize, callback: Callback) -> ReturnCode {
         match subscribe_num {
             // subscribe to all pin interrupts
-            // (no affect or reliance on individual pins being configured as interrupts)
+            // (no affect or reliance on individual pins being configured as
+            // interrupts)
             0 => {
-                self.callback.set(Some(callback));
+                self.app.enter(callback.app_id(), |app, _| {
+                    app.callback = Some(callback);
+                }).unwrap_or(());
                 ReturnCode::SUCCESS
             }
 
@@ -95,7 +107,7 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
         }
     }
 
-    fn command(&self, command_num: usize, data: usize, _: AppId) -> ReturnCode {
+    fn command(&self, command_num: usize, data: usize, app_id: AppId) -> ReturnCode {
         let pins = self.pins.as_ref();
         match command_num {
             // number of pins
@@ -178,6 +190,10 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
                 if pin_num >= pins.len() {
                     ReturnCode::EINVAL /* impossible pin */
                 } else {
+                    self.app.enter(app_id, |app, _| {
+                        app.subscribe_map |= 1 << pin_num;
+                    }).unwrap_or(());
+
                     let mut err_code = self.configure_input_pin(pin_num, pin_config);
                     if err_code == ReturnCode::SUCCESS {
                         err_code = self.configure_interrupt(pin_num, irq_config);

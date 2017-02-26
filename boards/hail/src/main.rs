@@ -339,8 +339,8 @@ pub unsafe fn reset_handler() {
     );
     let gpio = static_init!(
         capsules::gpio::GPIO<'static, sam4l::gpio::GPIOPin>,
-        capsules::gpio::GPIO::new(gpio_pins),
-        224/8);
+        capsules::gpio::GPIO::new(gpio_pins, kernel::Container::create()),
+        96/8);
     for pin in gpio_pins.iter() {
         pin.set_client(gpio);
     }
