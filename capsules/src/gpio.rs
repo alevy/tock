@@ -1,8 +1,8 @@
 //! GPIO Capsule
 //!
-//! Provides a driver for userspace applications to control GPIO pins.
-//! GPIOs are presented through a driver interface with synchronous comands
-//! and a callback for interrupts.
+//! Provides a driver for userspace applications to control GPIO pins.  GPIOs
+//! are presented through a driver interface with synchronous comands and a
+//! callback for interrupts.
 
 use kernel::{AppId, Callback, Container, Driver, ReturnCode};
 use kernel::hil::gpio::{Pin, PinCtl, InputMode, InterruptMode, Client};
@@ -26,8 +26,7 @@ impl<'a, G: Pin + PinCtl> GPIO<'a, G> {
         }
     }
 
-    fn configure_input_pin(&self, pin_num: usize, config: usize) -> ReturnCode {
-        let pin = self.pins[pin_num];
+    fn configure_input_pin(&self, pin: &G, config: usize) -> ReturnCode {
         pin.make_input();
         match config {
             0 => {
@@ -49,21 +48,20 @@ impl<'a, G: Pin + PinCtl> GPIO<'a, G> {
         }
     }
 
-    fn configure_interrupt(&self, pin_num: usize, config: usize) -> ReturnCode {
-        let pins = self.pins.as_ref();
+    fn configure_interrupt(&self, pin_num: usize, pin: &G, config: usize) -> ReturnCode {
         match config {
             0 => {
-                pins[pin_num].enable_interrupt(pin_num, InterruptMode::EitherEdge);
+                pin.enable_interrupt(pin_num, InterruptMode::EitherEdge);
                 ReturnCode::SUCCESS
             }
 
             1 => {
-                pins[pin_num].enable_interrupt(pin_num, InterruptMode::RisingEdge);
+                pin.enable_interrupt(pin_num, InterruptMode::RisingEdge);
                 ReturnCode::SUCCESS
             }
 
             2 => {
-                pins[pin_num].enable_interrupt(pin_num, InterruptMode::FallingEdge);
+                pin.enable_interrupt(pin_num, InterruptMode::FallingEdge);
                 ReturnCode::SUCCESS
             }
 
@@ -75,17 +73,18 @@ impl<'a, G: Pin + PinCtl> GPIO<'a, G> {
 impl<'a, G: Pin> Client for GPIO<'a, G> {
     fn fired(&self, pin_num: usize) {
         // read the value of the pin
-        let pins = self.pins.as_ref();
-        let pin_state = pins[pin_num].read();
-
-        // schedule callback with the pin number and value
-        self.app.each(|app| {
-            app.callback.map(|mut cb| {
-                if app.subscribe_map | 1 << pin_num != 0 {
-                    cb.schedule(pin_num, pin_state as usize, 0);
-                }
+        self.pins.get(pin_num).map(|pin| {
+            let pin_state = pin.read();
+            // schedule callback with the pin number and value
+            self.app.each(|app| {
+                app.callback.map(|mut cb| {
+                    if app.subscribe_map | 1 << pin_num != 0 {
+                        cb.schedule(pin_num, pin_state as usize, 0);
+                    }
+                });
             });
-        });
+        }).unwrap_or(());
+
     }
 }
 
@@ -108,49 +107,41 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
     }
 
     fn command(&self, command_num: usize, data: usize, app_id: AppId) -> ReturnCode {
-        let pins = self.pins.as_ref();
+        let pins = self.pins;
         match command_num {
             // number of pins
             0 => ReturnCode::SuccessWithValue { value: pins.len() as usize },
 
             // enable output
             1 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].make_output();
+                pins.get(data).map(|pin| {
+                    pin.make_output();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // set pin
             2 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].set();
+                pins.get(data).map(|pin| {
+                    pin.set();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // clear pin
             3 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].clear();
+                pins.get(data).map(|pin| {
+                    pin.clear();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // toggle pin
             4 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].toggle();
+                pins.get(data).map(|pin| {
+                    pin.toggle();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // enable and configure input
@@ -160,22 +151,17 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
                 // this allows two values to be passed into a command interface
                 let pin_num = data & 0xFF;
                 let pin_config = (data >> 8) & 0xFF;
-                if pin_num >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    let err_code = self.configure_input_pin(pin_num, pin_config);
-                    err_code
-                }
+                pins.get(pin_num).map(|pin| {
+                    self.configure_input_pin(pin, pin_config)
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // read input
             6 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    let pin_state = pins[data].read();
+                pins.get(data).map(|pin| {
+                    let pin_state = pin.read();
                     ReturnCode::SuccessWithValue { value: pin_state as usize }
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // enable and configure interrupts on pin, also sets pin as input
@@ -187,41 +173,35 @@ impl<'a, G: Pin + PinCtl> Driver for GPIO<'a, G> {
                 let pin_num = data & 0xFF;
                 let pin_config = (data >> 8) & 0xFF;
                 let irq_config = (data >> 16) & 0xFF;
-                if pin_num >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
+                pins.get(pin_num).map(|pin| {
                     self.app.enter(app_id, |app, _| {
                         app.subscribe_map |= 1 << pin_num;
                     }).unwrap_or(());
 
-                    let mut err_code = self.configure_input_pin(pin_num, pin_config);
+                    let mut err_code = self.configure_input_pin(pin, pin_config);
                     if err_code == ReturnCode::SUCCESS {
-                        err_code = self.configure_interrupt(pin_num, irq_config);
+                        err_code = self.configure_interrupt(pin_num, pin, irq_config);
                     }
                     err_code
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // disable interrupts on pin, also disables pin
             // (no affect or reliance on registered callback)
             8 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].disable_interrupt();
-                    pins[data].disable();
+                pins.get(data).map(|pin| {
+                    pin.disable_interrupt();
+                    pin.disable();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // disable pin
             9 => {
-                if data >= pins.len() {
-                    ReturnCode::EINVAL /* impossible pin */
-                } else {
-                    pins[data].disable();
+                pins.get(data).map(|pin| {
+                    pin.disable();
                     ReturnCode::SUCCESS
-                }
+                }).unwrap_or(ReturnCode::EINVAL)
             }
 
             // default
