@@ -55,7 +55,7 @@ pub unsafe fn spi_dummy_test() {
     sam4l::gpio::PC[10].make_output();
     &sam4l::gpio::PC[10].set();
 
-    let pin2: &mut gpio::Pin = &mut sam4l::gpio::PC[31]; // It's on D2 of the IMIX
+    let pin2: &gpio::Pin = &sam4l::gpio::PC[31]; // It's on D2 of the IMIX
     pin2.make_output();
     pin2.set();
 

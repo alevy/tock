@@ -3,7 +3,7 @@
 use self::Pin::*;
 use core::cell::Cell;
 use core::mem;
-use core::ops::{Index, IndexMut};
+use core::ops::Index;
 use kernel::common::volatile_cell::VolatileCell;
 use kernel::hil;
 use nvic;
@@ -132,12 +132,6 @@ impl Index<usize> for Port {
 
     fn index(&self, index: usize) -> &GPIOPin {
         &self.pins[index]
-    }
-}
-
-impl IndexMut<usize> for Port {
-    fn index_mut(&mut self, index: usize) -> &mut GPIOPin {
-        &mut self.pins[index]
     }
 }
 
