@@ -14,6 +14,7 @@ pub mod led;
 pub mod nrf51822_serialization;
 pub mod timer;
 pub mod tmp006;
+pub mod pir;
 pub mod sdcard;
 pub mod si7021;
 pub mod spi;
