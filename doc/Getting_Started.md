@@ -6,7 +6,7 @@ developing Tock.
 
 ## Requirements
 
-1. [Rust](http://www.rust-lang.org/) (version nightly-2017-01-25)
+1. [Rust](http://www.rust-lang.org/) (version nightly-2017-05-02)
 2. [arm-none-eabi toolchain](https://developer.arm.com/open-source/gnu-toolchain/gnu-rm/downloads) (version >= 5.2)
 3. Command line utilities: wget, sed, make
 
@@ -14,7 +14,7 @@ developing Tock.
 
 #### Rust (nightly)
 
-We are using `rustc 1.16.0-nightly (83c2d9523 2017-01-24)`. We recommend
+We are using `rustc 1.19.0-nightly (6a5fc9eec 2017-05-02)`. We recommend
 installing it with [rustup](http://www.rustup.rs) so you can manage multiple
 versions of Rust and continue using stable versions for other Rust code:
 
@@ -29,7 +29,7 @@ to your `$PATH`.
 Then install the correct nightly version of Rust:
 
 ```bash
-$ rustup install nightly-2017-01-25
+$ rustup install nightly-2017-05-03
 ```
 
 #### `arm-none-eabi` toolchain

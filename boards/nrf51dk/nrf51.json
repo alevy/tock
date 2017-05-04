@@ -11,6 +11,7 @@
     "relocation-model": "static",
     "linker": "arm-none-eabi-gcc",
     "linker-is-gnu": true,
+    "linker-flavor": "gcc",
     "disable-redzone": true,
     "features": "+strict-align",
     "pre-link-args": [

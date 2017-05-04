@@ -7,17 +7,21 @@
     "os": "none",
     "morestack": false,
     "executables": true,
-    "no-compiler-rt": true,
     "relocation-model": "static",
     "linker": "arm-none-eabi-gcc",
     "linker-is-gnu": true,
+    "linker-flavor": "gcc",
     "disable-redzone": true,
-    "pre-link-args": [
-        "-mcpu=cortex-m4", "-mthumb",
-        "-mfloat-abi=soft",
-        "-Wl,-gc-sections",
-        "-Tlayout.ld"
-    ],
+    "pre-link-args": {
+        "gcc": [
+            "-nostartfiles",
+            "-mcpu=cortex-m4",
+            "-mthumb",
+            "-mfloat-abi=soft",
+            "-Wl,-gc-sections",
+            "-Tlayout.ld"
+        ]
+    },
     "post-link-args": [
         "-lm", "-lgcc", "-lc"
     ]

@@ -24,3 +24,8 @@ cortexm4 = { path = "../../arch/cortex-m4" }
 capsules = { path = "../../capsules" }
 kernel = { path = "../../kernel" }
 sam4l = { path = "../../chips/sam4l" }
+
+[dependencies.compiler_builtins]
+git = "https://github.com/rust-lang-nursery/compiler-builtins"
+features = ["c"]
+
