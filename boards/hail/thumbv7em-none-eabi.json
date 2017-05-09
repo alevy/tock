@@ -1,17 +1,15 @@
 {
-    "data-layout": "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64",
-    "llvm-target": "thumbv7em-none-eabi",
-    "target-endian": "little",
-    "target-pointer-width": "32",
     "arch": "arm",
-    "os": "none",
-    "morestack": false,
-    "executables": true,
-    "relocation-model": "static",
-    "linker": "arm-none-eabi-gcc",
-    "linker-is-gnu": true,
-    "linker-flavor": "gcc",
+    "data-layout": "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64",
     "disable-redzone": true,
+    "executables": true,
+    "linker": "arm-none-eabi-gcc",
+    "linker-flavor": "gcc",
+    "linker-is-gnu": true,
+    "llvm-target": "thumbv7em-none-eabi",
+    "morestack": false,
+    "os": "none",
+    "relocation-model": "static",
     "pre-link-args": {
         "gcc": [
             "-nostartfiles",
@@ -22,7 +20,6 @@
             "-Tlayout.ld"
         ]
     },
-    "post-link-args": [
-        "-lm", "-lgcc", "-lc"
-    ]
+    "target-endian": "little",
+    "target-pointer-width": "32"
 }
