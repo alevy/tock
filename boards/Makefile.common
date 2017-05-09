@@ -21,7 +21,11 @@ $(error Required make variable CHIP is not defined)
 endif
 
 ifndef TARGET
-TARGET := $(CHIP).json
+  ifeq ($(CHIP),sam4l)
+  TARGET := thumbv7em-none-eabi.json
+  else
+  $(error Need to set TARGET for unknown CHIP=$(CHIP))
+  endif
 endif
 
 # If environment variable V is non-empty, be verbose
