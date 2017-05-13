@@ -22,7 +22,7 @@ endif
 
 ifndef TARGET
   ifeq ($(CHIP),sam4l)
-  TARGET := thumbv7em-none-eabi.json
+  TARGET := thumbv7em-none-eabi
   else
   $(error Need to set TARGET for unknown CHIP=$(CHIP))
   endif
@@ -66,7 +66,10 @@ target/$(CHIP)/release/$(PLATFORM).elf: target/$(CHIP)/release/$(PLATFORM)
 
 .PHONY: target/$(CHIP)/release/$(PLATFORM)
 target/$(CHIP)/release/$(PLATFORM):
-	$(Q)cargo build $(VERBOSE) --release --target=$(TARGET)
+	$(Q)rustup component add rust-src
+	# This is a lovely hack that needs further investigation
+	$(Q)cargo build $(VERBOSE) --release --target=$(TARGET) || exit 0
+	$(Q)xargo build --target=$(TARGET) $(VERBOSE) --release
 	$(Q)$(SIZE) $@
 
 target/$(CHIP)/debug/$(PLATFORM).elf: target/$(CHIP)/debug/$(PLATFORM)
@@ -74,7 +77,7 @@ target/$(CHIP)/debug/$(PLATFORM).elf: target/$(CHIP)/debug/$(PLATFORM)
 
 .PHONY: target/$(CHIP)/debug/$(PLATFORM)
 target/$(CHIP)/debug/$(PLATFORM):
-	$(Q)cargo build $(VERBOSE) --target=$(TARGET)
+	$(Q)xargo build $(VERBOSE) --target=$(TARGET)
 	$(Q)$(OBJDUMP) $(OBJDUMP_FLAGS) $@ > target/$(CHIP)/debug/$(PLATFORM).lst
 	$(Q)$(SIZE) $@
 
@@ -92,6 +95,7 @@ target/$(CHIP)/debug/$(PLATFORM).bin: target/$(CHIP)/debug/$(PLATFORM).elf
 
 .PHONY: clean
 clean::
+	$(Q)xargo clean $(VERBOSE)
 	$(Q)cargo clean $(VERBOSE)
 
 .PHONY: debug

@@ -27,4 +27,5 @@ sam4l = { path = "../../chips/sam4l" }
 
 [dependencies.compiler_builtins]
 git = "https://github.com/rust-lang-nursery/compiler-builtins"
+#path = "/Users/ppannuto/code/external/compiler-builtins"
 features = ["c"]

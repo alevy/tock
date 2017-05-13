@@ -4,6 +4,7 @@
 
 extern crate capsules;
 extern crate cortexm4;
+extern crate compiler_builtins;
 #[macro_use(static_init)]
 extern crate kernel;
 extern crate sam4l;
