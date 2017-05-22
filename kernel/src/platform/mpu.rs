@@ -18,6 +18,7 @@ pub enum ExecutePermission {
     ExecutionNotPermitted = 0b1,
 }
 
+#[derive(Clone,Copy)]
 pub struct Region {
     base_address: u32,
     attributes: u32,

@@ -36,10 +36,9 @@ pub use platform::systick::SysTick;
 pub use process::{Process, State};
 pub use returncode::ReturnCode;
 
-pub fn main<P: Platform, C: Chip>(platform: &P,
-                                  chip: &mut C,
-                                  processes: &'static mut [Option<process::Process<'static>>],
-                                  ipc: &ipc::IPC) {
+pub fn main<P: Platform>(platform: &P,
+                         processes: &'static mut [Option<process::Process<'static>>],
+                         ipc: &ipc::IPC) {
     let processes = unsafe {
         process::PROCS = processes;
         &mut process::PROCS
@@ -47,11 +46,12 @@ pub fn main<P: Platform, C: Chip>(platform: &P,
 
     loop {
         unsafe {
+            let chip = platform.chip();
             chip.service_pending_interrupts();
 
             for (i, p) in processes.iter_mut().enumerate() {
                 p.as_mut().map(|process| {
-                    sched::do_process(platform, chip, process, AppId::new(i), ipc);
+                    sched::do_process(platform, process, AppId::new(i), ipc);
                 });
                 if chip.has_pending_interrupts() {
                     break;

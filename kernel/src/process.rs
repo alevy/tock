@@ -216,19 +216,13 @@ pub struct Process<'a> {
     /// How to deal with Faults occuring in the process
     fault_response: FaultResponse,
 
-    /// MPU regions are saved as a pointer-size pair.
-    ///
-    /// size is encoded as X where
-    /// SIZE = 2^(X + 1) and X >= 4.
-    ///
-    /// A null pointer represents an empty region.
-    ///
-    /// # Invariants
-    ///
-    /// The pointer must be aligned to the size. E.g. if the size is 32 bytes, the pointer must be
-    /// 32-byte aligned.
-    ///
-    mpu_regions: [Cell<(*const u8, math::PowerOfTwo)>; 5],
+    text_region: mpu::Region,
+
+    data_region: mpu::Region,
+
+    grant_region: Cell<mpu::Region>,
+
+    mpu_regions: [Cell<mpu::Region>; 5],
 
     tasks: RingBuffer<'a, Task>,
 
@@ -337,86 +331,35 @@ impl<'a> Process<'a> {
     }
 
     pub fn setup_mpu<MPU: mpu::MPU>(&self, mpu: &MPU) {
-        // Text segment read/execute (no write)
-        let text_start = self.text.as_ptr() as usize;
-        let text_len = self.text.len();
-
-        match MPU::create_region(0, text_start, text_len,
-                        mpu::ExecutePermission::ExecutionPermitted,
-                        mpu::AccessPermission::ReadOnly) {
-            None =>
-                panic!("Infeasible MPU allocation. Base {:#x}, Length: {:#x}",
-                           text_start, text_len),
-            Some(region) => mpu.set_mpu(region),
-        }
-
-        let data_start = self.memory.as_ptr() as usize;
-        let data_len = self.memory.len();
-
-        match MPU::create_region(1, data_start, data_len,
-                        mpu::ExecutePermission::ExecutionPermitted,
-                        mpu::AccessPermission::ReadWrite) {
-            None =>
-                panic!("Infeasible MPU allocation. Base {:#x}, Length: {:#x}",
-                           data_start, data_len),
-            Some(region) => mpu.set_mpu(region)
-        }
-
-        // Disallow access to grant region
-        let grant_len = unsafe {
-            math::PowerOfTwo::ceiling(
-                self.memory.as_ptr().offset(self.memory.len() as isize) as u32 -
-                    (self.kernel_memory_break as u32)
-            ).as_num::<u32>()
-        };
-        let grant_base = unsafe {
-            self.memory
-                .as_ptr()
-                .offset(self.memory.len() as isize)
-                .offset(-(grant_len as isize))
-        };
-
-        match MPU::create_region(2, grant_base as usize, grant_len as usize,
-                                 mpu::ExecutePermission::ExecutionNotPermitted,
-                                 mpu::AccessPermission::PrivilegedOnly) {
-            None =>
-                panic!("Infeasible MPU allocation. Base {:#x}, Length: {:#x}",
-                           grant_base as usize, grant_len),
-            Some(region) => mpu.set_mpu(region)
-        }
-
+        mpu.set_mpu(self.text_region);
+        mpu.set_mpu(self.data_region);
+        mpu.set_mpu(self.grant_region.get());
         // Setup IPC MPU regions
-        for (i, region) in self.mpu_regions.iter().enumerate() {
-            match MPU::create_region(i + 3,
-                                     region.get().0 as usize,
-                                     region.get().1.as_num::<u32>() as usize,
-                                     mpu::ExecutePermission::ExecutionPermitted,
-                                     mpu::AccessPermission::ReadWrite) {
-                None => {},
-                Some(region) => mpu.set_mpu(region)
-            }
+        for region in self.mpu_regions.iter() {
+            mpu.set_mpu(region.get())
         }
     }
 
     pub fn add_mpu_region(&self, base: *const u8, size: u32) -> bool {
-        if size >= 16 && size.count_ones() == 1 && (base as u32) % size == 0 {
-            let mpu_size = math::PowerOfTwo::floor(size);
-            for region in self.mpu_regions.iter() {
-                if region.get().0 == ptr::null() {
-                    region.set((base, mpu_size));
-                    return true;
-                } else if region.get().0 == base {
-                    if region.get().1 < mpu_size {
-                        region.set((base, mpu_size));
-                    }
-                    return true;
+        return false;
+        /*if size >= 16 && size.count_ones() == 1 && (base as u32) % size == 0 {
+            let mpu_size = math::PowerOfTwo::floor(size).as_num::<u32>() as usize;
+            for (i, region) in self.mpu_regions.iter().enumerate() {
+                if region.get().attributes() != 0 {
+                    continue;
+                }
+                match mpu::MPU::create_region(i + 3, base as usize, mpu_size,
+                                     mpu::ExecutePermission::ExecutionPermitted,
+                                     mpu::AccessPermission::ReadWrite) {
+                    None => return false,
+                    Some(r) => region.set(r)
                 }
             }
         }
-        return false;
+        return false;*/
     }
 
-    pub unsafe fn create(app_flash_address: *const u8,
+    pub unsafe fn create<MPU: mpu::MPU>(app_flash_address: *const u8,
                          remaining_app_memory: *mut u8,
                          remaining_app_memory_size: usize,
                          fault_response: FaultResponse)
@@ -436,9 +379,6 @@ impl<'a> Process<'a> {
                 let app_slice_size_unaligned = load_result.fixed_len + app_heap_len +
                                                kernel_heap_len;
                 let app_slice_size = math::closest_power_of_two(app_slice_size_unaligned) as usize;
-                // TODO round app_slice_size up to a closer MPU unit.
-                // This is a very conservative approach that rounds up to power of
-                // two. We should be able to make this closer to what we actually need.
 
                 if app_slice_size > remaining_app_memory_size {
                     panic!("{:?} failed to load. Insufficient memory. Requested {} have {}",
@@ -477,6 +417,31 @@ impl<'a> Process<'a> {
                                                              callback_len);
                 let tasks = RingBuffer::new(callback_buf);
 
+                let text_region =
+                    MPU::create_region(0, app_flash_address as usize, app_flash_size,
+                        mpu::ExecutePermission::ExecutionPermitted,
+                        mpu::AccessPermission::ReadOnly).unwrap();
+
+                let data_region =
+                    MPU::create_region(1,
+                        app_memory.as_ptr() as usize, app_memory.len(),
+                        mpu::ExecutePermission::ExecutionPermitted,
+                        mpu::AccessPermission::ReadWrite).unwrap();
+
+                let grant_len = math::PowerOfTwo::ceiling(
+                        app_memory.as_ptr().offset(
+                            app_memory.len() as isize) as u32 -
+                            (kernel_memory_break as u32)
+                    ).as_num::<u32>();
+                let grant_base = app_memory
+                        .as_ptr()
+                        .offset(app_memory.len() as isize)
+                        .offset(-(grant_len as isize));
+                let grant_region =
+                    MPU::create_region(2, grant_base as usize, grant_len as usize,
+                                 mpu::ExecutePermission::ExecutionNotPermitted,
+                                 mpu::AccessPermission::PrivilegedOnly).unwrap();
+
                 let mut process = Process {
                     memory: app_memory,
 
@@ -501,11 +466,14 @@ impl<'a> Process<'a> {
                     state: State::Yielded,
                     fault_response: fault_response,
 
-                    mpu_regions: [Cell::new((ptr::null(), math::PowerOfTwo::zero())),
-                                  Cell::new((ptr::null(), math::PowerOfTwo::zero())),
-                                  Cell::new((ptr::null(), math::PowerOfTwo::zero())),
-                                  Cell::new((ptr::null(), math::PowerOfTwo::zero())),
-                                  Cell::new((ptr::null(), math::PowerOfTwo::zero()))],
+                    text_region: text_region,
+                    data_region: data_region,
+                    grant_region: Cell::new(grant_region),
+                    mpu_regions: [Cell::new(mpu::Region::empty()),
+                                  Cell::new(mpu::Region::empty()),
+                                  Cell::new(mpu::Region::empty()),
+                                  Cell::new(mpu::Region::empty()),
+                                  Cell::new(mpu::Region::empty())],
                     tasks: tasks,
                     package_name: load_result.package_name,
                 };

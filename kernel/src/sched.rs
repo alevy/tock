@@ -7,11 +7,11 @@ use process::{Process, Task};
 use returncode::ReturnCode;
 use syscall::Syscall;
 
-pub unsafe fn do_process<P: Platform, C: Chip>(platform: &P,
-                                               chip: &mut C,
-                                               process: &mut Process,
-                                               appid: ::AppId,
-                                               ipc: &::ipc::IPC) {
+pub unsafe fn do_process<P: Platform>(platform: &P,
+                                      process: &mut Process,
+                                      appid: ::AppId,
+                                      ipc: &::ipc::IPC) {
+    let chip = platform.chip();
     let systick = chip.systick();
     systick.reset();
     systick.set_timer(10000);

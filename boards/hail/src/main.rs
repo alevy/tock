@@ -51,10 +51,9 @@ unsafe fn load_processes() -> &'static mut [Option<kernel::process::Process<'sta
     let mut app_memory_size = APP_MEMORY.len();
     for i in 0..NUM_PROCS {
         let (process, flash_offset, memory_offset) =
-            kernel::process::Process::create(apps_in_flash_ptr,
-                                             app_memory_ptr,
-                                             app_memory_size,
-                                             FAULT_RESPONSE);
+            kernel::process::Process::create::<cortexm4::mpu::MPU>(
+                apps_in_flash_ptr, app_memory_ptr, app_memory_size,
+                FAULT_RESPONSE);
 
         if process.is_none() {
             break;
@@ -70,6 +69,7 @@ unsafe fn load_processes() -> &'static mut [Option<kernel::process::Process<'sta
 }
 
 struct Hail {
+    chip: sam4l::chip::Sam4l,
     console: &'static Console<'static, usart::USART>,
     gpio: &'static capsules::gpio::GPIO<'static, sam4l::gpio::GPIOPin>,
     timer: &'static TimerDriver<'static, VirtualMuxAlarm<'static, sam4l::ast::Ast<'static>>>,
@@ -90,6 +90,12 @@ struct Hail {
 }
 
 impl Platform for Hail {
+    type Chip = sam4l::chip::Sam4l;
+
+    fn chip(&self) -> &Self::Chip {
+        &self.chip
+    }
+
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
         where F: FnOnce(Option<&kernel::Driver>) -> R
     {
@@ -367,6 +373,7 @@ pub unsafe fn reset_handler() {
 
 
     let hail = Hail {
+        chip: sam4l::chip::Sam4l::new(),
         console: console,
         gpio: gpio,
         timer: timer,
@@ -399,12 +406,11 @@ pub unsafe fn reset_handler() {
 
     hail.nrf51822.initialize();
 
-    let mut chip = sam4l::chip::Sam4l::new();
-    chip.mpu().enable_mpu();
+    hail.chip.mpu().enable_mpu();
 
     // Uncomment to measure overheads for TakeCell and MapCell:
     // test_take_map_cell::test_take_map_cell();
 
     // debug!("Initialization complete. Entering main loop");
-    kernel::main(&hail, &mut chip, load_processes(), &hail.ipc);
+    kernel::main(&hail, load_processes(), &hail.ipc);
 }
