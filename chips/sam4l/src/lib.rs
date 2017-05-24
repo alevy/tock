@@ -178,7 +178,6 @@ pub static INTERRUPT_TABLE: [Option<unsafe extern fn()>; 80] = [
 ];
 
 pub unsafe fn init() {
-
     // Relocate data segment.
     // Assumes data starts right after text segment as specified by the linker
     // file.

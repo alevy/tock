@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(asm,const_fn,lang_items)]
+#![feature(asm,core_intrinsics,const_fn,lang_items)]
 
 extern crate capsules;
 #[macro_use(debug, static_init)]
@@ -159,6 +159,13 @@ unsafe fn set_pin_primary_functions() {
 
 #[no_mangle]
 pub unsafe fn reset_handler() {
+    ::core::intrinsics::volatile_store(0xE000ED10 as *mut u32, 1 << 2);
+    let f = ::core::intrinsics::volatile_load(0xE000ED10 as *mut u32);
+    if f & 1 << 2 != 0 {
+        asm!("wfi");
+    }
+
+    loop {}
     sam4l::init();
 
     sam4l::pm::setup_system_clock(sam4l::pm::SystemClockSource::DfllRc32k, 48000000);

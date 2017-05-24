@@ -27,6 +27,12 @@ pub enum CK32Source {
     RC32K = 1,
 }
 
+pub unsafe fn set_retention() {
+    let control = (*BPM).control.get();
+    unlock_register(0x1c); // Control
+    (*BPM).control.set(control | 1 << 9);
+}
+
 #[inline(never)]
 pub unsafe fn set_ck32source(source: CK32Source) {
     let control = (*BPM).control.get();
