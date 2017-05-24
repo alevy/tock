@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(asm,const_fn,lang_items)]
+#![feature(asm,const_fn,lang_items,compiler_builtins_lib)]
 
 extern crate capsules;
 extern crate cortexm4;

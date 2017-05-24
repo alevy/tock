@@ -68,7 +68,7 @@ target/$(CHIP)/release/$(PLATFORM).elf: target/$(CHIP)/release/$(PLATFORM)
 target/$(CHIP)/release/$(PLATFORM):
 	$(Q)rustup component add rust-src
 	# This is a lovely hack that needs further investigation
-	$(Q)cargo build $(VERBOSE) --release --target=$(TARGET) || exit 0
+	#$(Q)cargo build $(VERBOSE) --release --target=$(TARGET) || exit 0
 	$(Q)xargo build --target=$(TARGET) $(VERBOSE) --release
 	$(Q)$(SIZE) $@
 
