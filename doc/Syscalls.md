@@ -1,4 +1,4 @@
-# Syscalls
+# System Calls
 
 This document explains how [system
 calls](https://en.wikipedia.org/wiki/System_call) work in Tock with regards
@@ -204,35 +204,4 @@ First, in [`sched.rs`](../kernel/src/sched.rs) the number of the `svc` is
 matched against the valid syscall types. `yield` and `memop` have special
 functionality that is handled by the kernel. `command`, `subscribe`, and
 `allow` are routed to drivers for handling.
-
-
-
-
-
-## Allocated Driver Numbers
-
-| Driver Number | Driver           | Description                                |
-|---------------|------------------|--------------------------------------------|
-| 0             | Console          | UART console                               |
-| 1             | GPIO             |                                            |
-| 2             | TMP006           | Temperature sensor                         |
-| 3             | Timer            |                                            |
-| 4             | SPI              | Raw SPI interface                          |
-| 5             | nRF51822         | nRF serialization link to nRF51822 BLE SoC |
-| 6             | ISL29035         | Light sensor                               |
-| 7             | ADC              |                                            |
-| 8             | LED              |                                            |
-| 9             | Button           |                                            |
-| 10            | SI7021           | Temperature sensor                         |
-| 11            | Ninedof          | Virtualized accelerometer/magnetometer/gyroscope |
-| 12            | TSL2561          | Light sensor                               |
-| 13            | I2C Master/Slave | Raw I2C interface                          |
-| 14            | RNG              | Random number generator                    |
-| 15            | SDCard           | Raw block access to an SD card             |
-| 16            | CRC              | Cyclic Redundancy Check computation        |
-| 17            | AES              | AES encryption and decryption              |
-| 18            | LTC294X          | Battery gauge IC                           |
-| 22            | LPS25HB          | Pressure sensor                            |
-| 154           | Radio            | 15.4 radio interface                       |
-| 255           | IPC              | Inter-process communication                |
 
