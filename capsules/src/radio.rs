@@ -15,6 +15,9 @@ use kernel::common::take_cell::{MapCell, TakeCell};
 use mac;
 use net::ieee802154::{MacAddress, Header};
 
+/// Syscall number
+pub const DRIVER_NUM: usize = 0x30001;
+
 struct App {
     tx_callback: Option<Callback>,
     rx_callback: Option<Callback>,
