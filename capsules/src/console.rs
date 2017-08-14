@@ -133,7 +133,15 @@ impl<'a, U: UART> Console<'a, U> {
             self.in_progress.set(Some(app_id));
             self.tx_buffer.take().map(|buffer| {
                 let mut transaction_len = app.write_remaining;
-                for (i, c) in slice.as_ref()[slice.len() - app.write_remaining..slice.len()]
+                // It's possible for a buggy process to update force a value of
+                // `write_remaining` that is too large by replacing it's slice
+                // while a transaction is in progress. A sane processes won't do
+                // this as long as it doesn't `allow` before it gets a callback
+                // for a previously started transaction, so just spit out
+                // garbage from it's slice. It won't fix the process behavior,
+                // but it will be a valid slice index.
+                let start_idx = slice.len() - cmp::min(0, app.write_remaining);
+                for (i, c) in slice.as_ref()[start_idx..slice.len()]
                     .iter()
                     .enumerate() {
                     if buffer.len() <= i {
@@ -147,7 +155,6 @@ impl<'a, U: UART> Console<'a, U> {
                 if app.write_remaining > buffer.len() {
                     transaction_len = buffer.len();
                     app.write_remaining -= buffer.len();
-                    app.write_buffer = Some(slice);
                 } else {
                     app.write_remaining = 0;
                 }
@@ -156,8 +163,8 @@ impl<'a, U: UART> Console<'a, U> {
             });
         } else {
             app.pending_write = true;
-            app.write_buffer = Some(slice);
         }
+        app.write_buffer = Some(slice);
     }
 }
 
@@ -187,6 +194,8 @@ impl<'a, U: UART> Driver for Console<'a, U> {
                 self.apps
                     .enter(appid, |app, _| {
                         app.write_buffer = Some(slice);
+                        app.write_remaining = 0;
+                        app.pending_write = false;
                         ReturnCode::SUCCESS
                     })
                     .unwrap_or_else(|err| match err {
@@ -268,6 +277,7 @@ impl<'a, U: UART> Client for Console<'a, U> {
                             // Go ahead and signal the application
                             let written = app.write_len;
                             app.write_len = 0;
+                            app.pending_write = false;
                             app.write_callback.map(|mut cb| { cb.schedule(written, 0, 0); });
                         }
                     }
