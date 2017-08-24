@@ -28,6 +28,13 @@ use kernel::hil::i2c::{I2CDevice, I2CClient, Error};
 
 pub static mut BUF: [u8; 6] = [0; 6];
 
+#[derive(PartialEq, Eq, Copy, Clone)]
+enum OnDeck {
+    Nothing,
+    Acceleration,
+    Magnetism,
+}
+
 #[allow(dead_code)]
 enum Registers {
     Status = 0x00,
@@ -147,7 +154,7 @@ enum Registers {
     AFfmtThsZLsb = 0x78,
 }
 
-#[derive(Clone,Copy,PartialEq)]
+#[derive(Clone,Copy,Debug,PartialEq)]
 enum State {
     /// Sensor is in standby mode
     Disabled,
@@ -179,7 +186,9 @@ pub struct Fxos8700cq<'a> {
     interrupt_pin1: &'a gpio::Pin,
     state: Cell<State>,
     buffer: TakeCell<'static, [u8]>,
-    callback: Cell<Option<&'static hil::sensors::NineDofClient>>,
+    accel_callback: Cell<Option<&'static hil::sensors::AccelerometerClient>>,
+    magnet_callback: Cell<Option<&'static hil::sensors::MagnetometerClient>>,
+    on_deck: Cell<OnDeck>,
 }
 
 impl<'a> Fxos8700cq<'a> {
@@ -192,7 +201,9 @@ impl<'a> Fxos8700cq<'a> {
             interrupt_pin1: interrupt_pin1,
             state: Cell::new(State::Disabled),
             buffer: TakeCell::new(buffer),
-            callback: Cell::new(None),
+            accel_callback: Cell::new(None),
+            magnet_callback: Cell::new(None),
+            on_deck: Cell::new(OnDeck::Nothing),
         }
     }
 
@@ -216,7 +227,7 @@ impl<'a> Fxos8700cq<'a> {
             self.i2c.enable();
             // Configure the magnetometer.
             buf[0] = Registers::MCtrlReg1 as u8;
-            buf[1] = 0b00100001; // Enable magnetometer and one-shot read.
+            buf[1] = 0b00100011; // Enable magnetometer and one-shot read.
             self.i2c.write(buf, 2);
             self.state.set(State::ReadMagStart);
         });
@@ -225,25 +236,28 @@ impl<'a> Fxos8700cq<'a> {
 
 impl<'a> gpio::Client for Fxos8700cq<'a> {
     fn fired(&self, _: usize) {
-        self.buffer.take().map(|buffer| {
-            self.interrupt_pin1.disable_interrupt();
+        self.buffer
+            .take()
+            .map(|buffer| {
+                self.interrupt_pin1.disable_interrupt();
 
-            // When we get this interrupt we can read the sample.
-            self.i2c.enable();
-            buffer[0] = Registers::OutXMsb as u8;
-            self.i2c.write_read(buffer, 1, 6); // read 6 accel registers for xyz
-            self.state.set(State::ReadAccelReading);
-        });
+                // When we get this interrupt we can read the sample.
+                self.i2c.enable();
+                buffer[0] = Registers::OutXMsb as u8;
+                self.i2c.write_read(buffer, 1, 6); // read 6 accel registers for xyz
+                self.state.set(State::ReadAccelReading);
+            })
+            .expect("No buffer");
     }
 }
 
 impl<'a> I2CClient for Fxos8700cq<'a> {
     fn command_complete(&self, buffer: &'static mut [u8], _error: Error) {
+        if _error != Error::CommandComplete {
+            panic!("{:?}", _error);
+        }
         match self.state.get() {
             State::ReadAccelSetup => {
-                // Setup the interrupt so we know when the sample is ready
-                self.interrupt_pin1.enable_interrupt(0, gpio::InterruptMode::FallingEdge);
-
                 // Enable the accelerometer.
                 buffer[0] = Registers::CtrlReg1 as u8;
                 buffer[1] = 1;
@@ -259,6 +273,10 @@ impl<'a> I2CClient for Fxos8700cq<'a> {
                     self.state.set(State::ReadAccelReading);
                 } else {
                     // Wait for the interrupt to trigger
+
+                    // Setup the interrupt so we know when the sample is ready
+                    self.interrupt_pin1.enable_interrupt(0, gpio::InterruptMode::FallingEdge);
+
                     self.buffer.replace(buffer);
                     self.i2c.disable();
                     self.state.set(State::ReadAccelWaiting);
@@ -283,7 +301,13 @@ impl<'a> I2CClient for Fxos8700cq<'a> {
                 self.i2c.disable();
                 self.state.set(State::Disabled);
                 self.buffer.replace(buffer);
-                self.callback.get().map(|cb| { cb.callback(x as usize, y as usize, z as usize); });
+                if OnDeck::Magnetism == self.on_deck.get() {
+                    self.on_deck.set(OnDeck::Nothing);
+                    self.start_read_magnetometer();
+                }
+                self.accel_callback
+                    .get()
+                    .map(|cb| { cb.callback(x as usize, y as usize, z as usize); });
             }
             State::ReadMagStart => {
                 // One shot measurement taken, now read result.
@@ -302,25 +326,51 @@ impl<'a> I2CClient for Fxos8700cq<'a> {
                 self.state.set(State::Disabled);
                 self.buffer.replace(buffer);
 
-                self.callback.get().map(|cb| cb.callback(x as usize, y as usize, z as usize));
+                if OnDeck::Acceleration == self.on_deck.get() {
+                    self.on_deck.set(OnDeck::Nothing);
+                    self.start_read_accel();
+                }
+                self.magnet_callback
+                    .get()
+                    .map(|cb| cb.callback(x as usize, y as usize, z as usize));
             }
             _ => {}
         }
     }
 }
 
-impl<'a> hil::sensors::NineDof for Fxos8700cq<'a> {
-    fn set_client(&self, client: &'static hil::sensors::NineDofClient) {
-        self.callback.set(Some(client));
+impl<'a> hil::sensors::Accelerometer for Fxos8700cq<'a> {
+    fn set_client(&self, client: &'static hil::sensors::AccelerometerClient) {
+        self.accel_callback.set(Some(client));
     }
 
-    fn read_accelerometer(&self) -> ReturnCode {
-        self.start_read_accel();
-        ReturnCode::SUCCESS
+    fn read(&self) -> ReturnCode {
+        if self.state.get() == State::Disabled {
+            self.start_read_accel();
+            ReturnCode::SUCCESS
+        } else if OnDeck::Nothing == self.on_deck.get() {
+            self.on_deck.set(OnDeck::Acceleration);
+            ReturnCode::SUCCESS
+        } else {
+            ReturnCode::EBUSY
+        }
+    }
+}
+
+impl<'a> hil::sensors::Magnetometer for Fxos8700cq<'a> {
+    fn set_client(&self, client: &'static hil::sensors::MagnetometerClient) {
+        self.magnet_callback.set(Some(client));
     }
 
-    fn read_magnetometer(&self) -> ReturnCode {
-        self.start_read_magnetometer();
-        ReturnCode::SUCCESS
+    fn read(&self) -> ReturnCode {
+        if self.state.get() == State::Disabled {
+            self.start_read_magnetometer();
+            ReturnCode::SUCCESS
+        } else if OnDeck::Nothing == self.on_deck.get() {
+            self.on_deck.set(OnDeck::Magnetism);
+            ReturnCode::SUCCESS
+        } else {
+            ReturnCode::EBUSY
+        }
     }
 }

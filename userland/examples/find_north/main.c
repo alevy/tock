@@ -2,7 +2,7 @@
 #include <stdio.h>
 
 #include <led.h>
-#include <ninedof.h>
+#include <magnetometer.h>
 
 int main(void) {
   int x, y, z;
@@ -14,7 +14,7 @@ int main(void) {
   if (num_leds > 1) led = 1;
 
   while (1) {
-    ninedof_read_magenetometer_sync(&x, &y, &z);
+    magnetometer_read_sync(&x, &y, &z);
     printf("x: %d, y: %d, z: %d\n", x, y, z);
 
     // Compute the X-Y angle of the board.

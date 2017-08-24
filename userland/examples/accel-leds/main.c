@@ -1,15 +1,15 @@
 #include <limits.h>
 #include <stdio.h>
 
+#include <accelerometer.h>
 #include <led.h>
-#include <ninedof.h>
 
 int main(void) {
   printf("[App] Accelerometer -> LEDs\n");
 
   while (1) {
     int x, y, z;
-    ninedof_read_acceleration_sync(&x, &y, &z);
+    accelerometer_read_sync(&x, &y, &z);
 
     // abs()
     if (x < 0) x *= -1;
@@ -25,6 +25,7 @@ int main(void) {
     if (x == largest) led_on(0); else led_off(0);
     if (y == largest) led_on(1); else led_off(1);
     if (z == largest) led_on(2); else led_off(2);
+    delay_ms(100);
   }
 
   return 0;

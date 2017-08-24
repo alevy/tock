@@ -60,7 +60,8 @@ struct Imix {
     button: &'static capsules::button::Button<'static, sam4l::gpio::GPIOPin>,
     spi: &'static capsules::spi::Spi<'static, VirtualSpiMasterDevice<'static, sam4l::spi::Spi>>,
     ipc: kernel::ipc::IPC,
-    ninedof: &'static capsules::ninedof::NineDof<'static>,
+    accelerometer: &'static capsules::accelerometer::Accelerometer<'static>,
+    magnetometer: &'static capsules::magnetometer::Magnetometer<'static>,
     radio: &'static capsules::radio::RadioDriver<'static,
                                                  capsules::mac::MacDevice<'static, RF233Device>>,
     crc: &'static capsules::crc::Crc<'static, sam4l::crccu::Crccu<'static>>,
@@ -101,7 +102,8 @@ impl kernel::Platform for Imix {
             capsules::ambient_light::DRIVER_NUM => f(Some(self.ambient_light)),
             capsules::temperature::DRIVER_NUM => f(Some(self.temp)),
             capsules::humidity::DRIVER_NUM => f(Some(self.humidity)),
-            capsules::ninedof::DRIVER_NUM => f(Some(self.ninedof)),
+            capsules::accelerometer::DRIVER_NUM => f(Some(self.accelerometer)),
+            capsules::magnetometer::DRIVER_NUM => f(Some(self.magnetometer)),
             capsules::crc::DRIVER_NUM => f(Some(self.crc)),
             capsules::usb_user::DRIVER_NUM => f(Some(self.usb_driver)),
             capsules::radio::DRIVER_NUM => f(Some(self.radio)),
@@ -329,10 +331,17 @@ pub unsafe fn reset_handler() {
                                                &mut capsules::fxos8700cq::BUF));
     fxos8700_i2c.set_client(fxos8700);
     sam4l::gpio::PC[13].set_client(fxos8700);
-    let ninedof = static_init!(
-        capsules::ninedof::NineDof<'static>,
-        capsules::ninedof::NineDof::new(fxos8700, kernel::Container::create()));
-    hil::sensors::NineDof::set_client(fxos8700, ninedof);
+
+    let accelerometer = static_init!(
+        capsules::accelerometer::Accelerometer<'static>,
+        capsules::accelerometer::Accelerometer::new(fxos8700, kernel::Container::create()));
+    hil::sensors::Accelerometer::set_client(fxos8700, accelerometer);
+
+    let magnetometer = static_init!(
+        capsules::magnetometer::Magnetometer<'static>,
+        capsules::magnetometer::Magnetometer::new(fxos8700, kernel::Container::create()));
+    hil::sensors::Magnetometer::set_client(fxos8700, magnetometer);
+
 
     // Clear sensors enable pin to enable sensor rail
     // sam4l::gpio::PC[16].enable_output();
@@ -448,7 +457,8 @@ pub unsafe fn reset_handler() {
         crc: crc,
         spi: spi_syscalls,
         ipc: kernel::ipc::IPC::new(),
-        ninedof: ninedof,
+        accelerometer: accelerometer,
+        magnetometer: magnetometer,
         radio: radio_capsule,
         usb_driver: usb_driver,
     };

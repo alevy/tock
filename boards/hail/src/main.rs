@@ -57,7 +57,8 @@ struct Hail {
                                                                  sam4l::ast::Ast<'static>>>,
     ambient_light: &'static capsules::ambient_light::AmbientLight<'static>,
     temp: &'static capsules::temperature::TemperatureSensor<'static>,
-    ninedof: &'static capsules::ninedof::NineDof<'static>,
+    accelerometer: &'static capsules::accelerometer::Accelerometer<'static>,
+    magnetometer: &'static capsules::magnetometer::Magnetometer<'static>,
     humidity: &'static capsules::humidity::HumiditySensor<'static>,
     spi: &'static capsules::spi::Spi<'static, VirtualSpiMasterDevice<'static, sam4l::spi::Spi>>,
     nrf51822: &'static capsules::nrf51822_serialization::Nrf51822Serialization<'static,
@@ -92,7 +93,8 @@ impl Platform for Hail {
             capsules::button::DRIVER_NUM => f(Some(self.button)),
             capsules::humidity::DRIVER_NUM => f(Some(self.humidity)),
             capsules::temperature::DRIVER_NUM => f(Some(self.temp)),
-            capsules::ninedof::DRIVER_NUM => f(Some(self.ninedof)),
+            capsules::accelerometer::DRIVER_NUM => f(Some(self.accelerometer)),
+            capsules::magnetometer::DRIVER_NUM => f(Some(self.magnetometer)),
 
             capsules::rng::DRIVER_NUM => f(Some(self.rng)),
 
@@ -276,10 +278,15 @@ pub unsafe fn reset_handler() {
     fxos8700_i2c.set_client(fxos8700);
     sam4l::gpio::PA[9].set_client(fxos8700);
 
-    let ninedof = static_init!(
-        capsules::ninedof::NineDof<'static>,
-        capsules::ninedof::NineDof::new(fxos8700, kernel::Container::create()));
-    hil::sensors::NineDof::set_client(fxos8700, ninedof);
+    let accelerometer = static_init!(
+        capsules::accelerometer::Accelerometer<'static>,
+        capsules::accelerometer::Accelerometer::new(fxos8700, kernel::Container::create()));
+    hil::sensors::Accelerometer::set_client(fxos8700, accelerometer);
+
+    let magnetometer = static_init!(
+        capsules::magnetometer::Magnetometer<'static>,
+        capsules::magnetometer::Magnetometer::new(fxos8700, kernel::Container::create()));
+    hil::sensors::Magnetometer::set_client(fxos8700, magnetometer);
 
     // Initialize and enable SPI HAL
     // Set up an SPI MUX, so there can be multiple clients
@@ -393,7 +400,8 @@ pub unsafe fn reset_handler() {
         ambient_light: ambient_light,
         temp: temp,
         humidity: humidity,
-        ninedof: ninedof,
+        accelerometer: accelerometer,
+        magnetometer: magnetometer,
         spi: spi_syscalls,
         nrf51822: nrf_serialization,
         adc: adc,

@@ -8,13 +8,14 @@
 #include <simple_adv.h>
 #include <simple_ble.h>
 
+#include <accelerometer.h>
 #include <adc.h>
 #include <ambient_light.h>
 #include <button.h>
 #include <gpio.h>
 #include <humidity.h>
 #include <led.h>
-#include <ninedof.h>
+#include <magnetometer.h>
 #include <nrf51_serialization.h>
 #include <temperature.h>
 #include <timer.h>
@@ -55,7 +56,7 @@ static void sample_sensors (void) {
   temperature_read_sync(&temp);
   unsigned humi;
   humidity_read_sync(&humi);
-  uint32_t accel_mag = ninedof_read_accel_mag();
+  uint32_t accel_mag = accelerometer_read_magnitude();
   int light          = ambient_light_read_intensity();
 
   // Analog inputs: A0-A5
