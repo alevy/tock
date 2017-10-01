@@ -14,14 +14,16 @@ static ble_gatts_char_handles_t btn_char_handle;
 static led_update_t led_update_buffer;
 
 static volatile int g_pid = 0;
-static volatile int g_buf = 0;
+static volatile char* g_buf = 0;
+static volatile int g_buf_len = 0;
 
-bool btn_ctrl_tx_arm(int pid, int buf) {
+bool btn_ctrl_tx_arm(int pid, char* buf, int len) {
     if ((g_pid != 0) || (g_buf != 0)) {
         return false;
     } else {
         g_pid = pid;
         g_buf = buf;
+        g_buf_len = len;
         return true;
     }
 }
@@ -102,10 +104,13 @@ void btn_ctrl_handle_write(ble_gatts_evt_write_t* context) {
 
       if((g_pid != 0) && (g_buf != 0)) {
           int pid = g_pid;
-          *(led_update_t*)g_buf = updt;
+          g_buf[g_buf_len - 1] = 0;
+          *(led_update_t*)(g_buf) = updt;
           g_buf = 0;
           g_pid = 0;
           ipc_notify_client(pid);
+      } else {
+        printf("Not armed...\n");
       }
   }
 }

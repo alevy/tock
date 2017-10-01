@@ -17,6 +17,7 @@
 #include <nrf51_serialization.h>
 #include <tock.h>
 
+#include "env_sense_service.h"
 #include "led_ctrl_service.h"
 
 /*******************************************************************************
@@ -85,6 +86,7 @@ void ble_error (uint32_t error_code) {
 
 // Will be called by the Simple BLE library.
 void services_init (void) {
+  env_sense_service_init();
   btn_ctrl_service_init();
 }
 
@@ -92,37 +94,56 @@ void services_init (void) {
  * IPC
  ******************************************************************************/
 
+typedef enum {
+  SENSOR_TEMPERATURE = 0,
+  SENSOR_IRRADIANCE = 1,
+  SENSOR_HUMIDITY = 2,
+} sensor_type_e;
 
-static void ipc_callback(int pid, int len, int buf, __attribute__ ((unused)) void* ud) {
-    printf("%d %d 0x%08x\n", pid, len, buf);
+typedef struct {
+  int type;  // sensor type
+  int value; // sensor reading
+} sensor_update_t;
 
-    if (!btn_ctrl_tx_arm(pid, buf)) {
-        printf("Error! Already armed!\n");
-    } else {
-        printf("Armed!\n");
+
+static void ipc_callback(int pid, int len, int ibuf, __attribute__ ((unused)) void* ud) {
+    char* buf = (char*)ibuf;
+    printf("%d %d %p\n", pid, len, buf);
+
+    if (buf[len - 1] == 0) {
+      // LED arm
+      if (!btn_ctrl_tx_arm(pid, buf, len)) {
+          printf("Error! Already armed!\n");
+      } else {
+          printf("Armed!\n");
+      }
+      return;
     }
-//   if (len < (int) sizeof(sensor_update_t)) {
-//     printf("Error! IPC message too short.\n");
-//     ipc_notify_client(pid);
-//     return;
-//   }
 
-//   sensor_update_t *update = (sensor_update_t*) buf;
+    // Otherwise, ESS reading update
 
-//   if (conn_handle != BLE_CONN_HANDLE_INVALID) {
-//     switch (update->type) {
-//       case SENSOR_TEMPERATURE:
-//         // env_sense_update_temperature(conn_handle, update->value);
-//         break;
-//       case SENSOR_IRRADIANCE:
-//         // env_sense_update_irradiance(conn_handle,  update->value);
-//         break;
-//       case SENSOR_HUMIDITY:
-//         // env_sense_update_humidity(conn_handle,  update->value);
-//         break;
-//     }
-//   }
-//   ipc_notify_client(pid);
+   if (len < (int) sizeof(sensor_update_t)) {
+     printf("Error! IPC message too short.\n");
+     ipc_notify_client(pid);
+     return;
+   }
+
+   sensor_update_t *update = (sensor_update_t*) buf;
+
+   if (conn_handle != BLE_CONN_HANDLE_INVALID) {
+     switch (update->type) {
+       case SENSOR_TEMPERATURE:
+         env_sense_update_temperature(conn_handle, update->value);
+         break;
+       case SENSOR_IRRADIANCE:
+         env_sense_update_irradiance(conn_handle,  update->value);
+         break;
+       case SENSOR_HUMIDITY:
+         env_sense_update_humidity(conn_handle,  update->value);
+         break;
+     }
+   }
+     ipc_notify_client(pid);
 }
 
 /*******************************************************************************

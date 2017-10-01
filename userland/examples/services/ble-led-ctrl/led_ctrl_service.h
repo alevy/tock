@@ -25,7 +25,7 @@ STATIC_ASSERT(offsetof(led_update_t, cmd)==1);
 
 void btn_ctrl_service_init(void);
 void btn_ctrl_handle_write(ble_gatts_evt_write_t* context);
-bool btn_ctrl_tx_arm(int pid, int buf);
+bool btn_ctrl_tx_arm(int pid, char* buf, int len);
 
 // uint32_t env_sense_update_irradiance(uint16_t conn, uint16_t irradiance);
 // uint32_t env_sense_update_temperature(uint16_t conn, int16_t temperature);
