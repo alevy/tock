@@ -183,7 +183,7 @@ pub struct TxState<'a> {
     dgram_offset: Cell<usize>,
     fragment: Cell<bool>,
     compress: Cell<bool>,
-    client: Cell<Option<&'static TransmitClient>>,
+    client: Cell<Option<&'a TransmitClient>>,
 
     next: ListLink<'a, TxState<'a>>,
 }
@@ -219,7 +219,7 @@ impl<'a> TxState<'a> {
     /// TxState::set_transmit_client
     /// ----------------------------
     /// Sets the TransmitClient callback field of the respective TxState struct.
-    pub fn set_transmit_client(&self, client: &'static TransmitClient) {
+    pub fn set_transmit_client(&'a self, client: &'a TransmitClient) {
         self.client.set(Some(client));
     }
 
@@ -523,7 +523,7 @@ impl<'a> RxState<'a> {
         }
     }
 
-    fn end_receive(&self, client: Option<&'static ReceiveClient>, result: ReturnCode) {
+    fn end_receive(&self, client: Option<&'a ReceiveClient>, result: ReturnCode) {
         self.busy.set(false);
         self.bitmap.map(|bitmap| bitmap.clear());
         self.timeout_counter.set(0);
@@ -543,9 +543,9 @@ impl<'a> RxState<'a> {
 /// ----------------
 /// This struct tracks the global sending/receiving state, and contains the
 /// lists of RxStates and TxStates.
-pub struct FragState<'a, A: time::Alarm + 'a> {
+pub struct FragState<'a, A: time::Alarm + 'a, C: ContextStore> {
     pub radio: &'a Mac<'a>,
-    ctx_store: &'a ContextStore,
+    ctx_store: C,
     alarm: &'a A,
 
     // Transmit state
@@ -556,12 +556,12 @@ pub struct FragState<'a, A: time::Alarm + 'a> {
 
     // Receive state
     rx_states: List<'a, RxState<'a>>,
-    rx_client: Cell<Option<&'static ReceiveClient>>,
+    rx_client: Cell<Option<&'a ReceiveClient>>,
 }
 
 // This function is called after transmitting a frame
 #[allow(unused_must_use)]
-impl<'a, A: time::Alarm> TxClient for FragState<'a, A> {
+impl<'a, A: time::Alarm, C: ContextStore> TxClient for FragState<'a, A, C> {
     fn send_done(&self, tx_buf: &'static mut [u8], acked: bool, result: ReturnCode) {
         if result != ReturnCode::SUCCESS {
             self.end_packet_transmit(tx_buf, acked, result);
@@ -586,7 +586,7 @@ impl<'a, A: time::Alarm> TxClient for FragState<'a, A> {
 }
 
 // This function is called after receiving a frame
-impl<'a, A: time::Alarm> RxClient for FragState<'a, A> {
+impl<'a, A: time::Alarm, C: ContextStore> RxClient for FragState<'a, A, C> {
     fn receive<'b>(&self, buf: &'b [u8], header: Header<'b>, data_offset: usize, data_len: usize) {
         // We return if retcode is not valid, as it does not make sense to issue
         // a callback for an invalid frame reception
@@ -606,7 +606,7 @@ impl<'a, A: time::Alarm> RxClient for FragState<'a, A> {
     }
 }
 
-impl<'a, A: time::Alarm> time::Client for FragState<'a, A> {
+impl<'a, A: time::Alarm, C: ContextStore> time::Client for FragState<'a, A, C> {
     fn fired(&self) {
         // Timeout any expired rx_states
         for state in self.rx_states.iter() {
@@ -621,15 +621,15 @@ impl<'a, A: time::Alarm> time::Client for FragState<'a, A> {
     }
 }
 
-impl<'a, A: time::Alarm> FragState<'a, A> {
+impl<'a, A: time::Alarm, C: ContextStore> FragState<'a, A, C> {
     /// FragState::new
     /// --------------
     /// This function initializes and returns a new FragState struct.
     pub fn new(radio: &'a Mac<'a>,
-               ctx_store: &'a ContextStore,
+               ctx_store: C,
                tx_buf: &'static mut [u8],
                alarm: &'a A)
-               -> FragState<'a, A> {
+               -> FragState<'a, A, C> {
         FragState {
             radio: radio,
             ctx_store: ctx_store,
@@ -667,7 +667,7 @@ impl<'a, A: time::Alarm> FragState<'a, A> {
     /// has been fully reassembled. In the current design, the concept of a
     /// receive client per RxState did not make sense; thus, there is a single
     /// receive client that receives all reassembled packets.
-    pub fn set_receive_client(&self, client: &'static ReceiveClient) {
+    pub fn set_receive_client(&'a self, client: &'a ReceiveClient) {
         self.rx_client.set(Some(client));
     }
 
@@ -728,7 +728,7 @@ impl<'a, A: time::Alarm> FragState<'a, A> {
                 .take()
                 .expect("Error: `tx_buf` is None in call to start_packet_transmit.");
 
-            match state.start_transmit(dgram_tag, frag_buf, self.radio, self.ctx_store) {
+            match state.start_transmit(dgram_tag, frag_buf, self.radio, &self.ctx_store) {
                 // Successfully started transmitting
                 Ok(_) => {
                     self.tx_dgram_tag.set(dgram_tag);
@@ -806,7 +806,7 @@ impl<'a, A: time::Alarm> FragState<'a, A> {
                     .expect("Error: `packet` in RxState struct is `None` \
                             in call to `receive_single_packet`.");
                 if is_lowpan(payload) {
-                    let decompressed = lowpan::decompress(self.ctx_store,
+                    let decompressed = lowpan::decompress(&self.ctx_store,
                                                           &payload[0..payload_len as usize],
                                                           src_mac_addr,
                                                           dst_mac_addr,
@@ -864,7 +864,7 @@ impl<'a, A: time::Alarm> FragState<'a, A> {
                                                    payload_len,
                                                    dgram_size,
                                                    dgram_offset,
-                                                   self.ctx_store);
+                                                   &self.ctx_store);
                 match res {
                     // Some error occurred
                     Err(_) => (Some(state), ReturnCode::FAIL),
