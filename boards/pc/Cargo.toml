@@ -1,0 +1,9 @@
+[package]
+name = "toxix"
+version = "0.1.0"
+authors = ["Amit Aryeh Levy <amit@amitlevy.com>"]
+
+[dependencies]
+capsules = { path = "../../capsules" }
+kernel = { path = "../../kernel" }
+nix = "0.10.0"
