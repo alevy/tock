@@ -288,6 +288,18 @@ pub unsafe fn reset_handler() {
         btn.set_client(button);
     }
 
+    let spi = &nrf52832::spi::SPIM1;
+    nrf52832::spi::SPIM1.configure(
+        nrf52832::pinmux::Pinmux::new(3),
+        nrf52832::pinmux::Pinmux::new(!0),
+        nrf52832::pinmux::Pinmux::new(4),
+    );
+    let epd = static_init!(capsules::epd::Epd<'static, nrf52832::spi::SPIM, nrf52832::gpio::GPIOPin>,
+                           capsules::epd::Epd::new(spi, &nrf52832::gpio::PORT[Pin::P0_07], &nrf52832::gpio::PORT[Pin::P0_06], &nrf52832::gpio::PORT[Pin::P0_05],
+                           &mut capsules::epd::FRAME_BUFFER));
+    kernel::hil::spi::SpiMaster::set_client(spi, epd);
+    epd.initialize();
+
     //
     // RTC for Timers
     //

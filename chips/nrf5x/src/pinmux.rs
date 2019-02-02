@@ -29,6 +29,10 @@ impl Pinmux {
     /// been created.
     ///
     pub unsafe fn new(pin: u32) -> Pinmux {
+        if pin == !0 { // Not connected
+            return Pinmux(pin);
+        }
+
         let port: usize = (pin as usize) / PIN_PER_PORT;
         let pin_idx: usize = (pin as usize) % PIN_PER_PORT;
         let used_pins = USED_PINS[port].get();
@@ -36,7 +40,7 @@ impl Pinmux {
             panic!("Pin {} is already in use!", pin);
         } else {
             USED_PINS[port].set(used_pins | 1 << pin_idx);
-            Pinmux(pin)
+            return Pinmux(pin);
         }
     }
 }
