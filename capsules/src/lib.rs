@@ -48,6 +48,7 @@ pub mod rf233_const;
 pub mod rng;
 pub mod sdcard;
 pub mod segger_rtt;
+pub mod serial_mux;
 pub mod si7021;
 pub mod spi;
 pub mod temperature;
