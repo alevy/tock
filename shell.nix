@@ -33,7 +33,7 @@ let
   });
   moz_overlay = import (builtins.fetchTarball https://github.com/mozilla/nixpkgs-mozilla/archive/master.tar.gz);
   nixpkgs = import <nixpkgs> { overlays = [ moz_overlay ]; };
-  rust_date = "2020-03-06";
+  rust_date = builtins.head (builtins.match "[a-z]+-([0-9\\-]+)\n" (builtins.readFile ./rust-toolchain));
   rust_channel = "nightly";
   rust_targets = [
     "thumbv7em-none-eabi" "thumbv7em-none-eabihf" "thumbv6m-none-eabi"
@@ -48,7 +48,14 @@ in
     buildInputs = [
       python3Full
       pythonPackages.tockloader
+
       rust_build
+      rustup
+      git
+
+      pkg-config
+      libusb1
+
       llvm
     ];
 
