@@ -15,6 +15,14 @@ pub struct Private;
 #[derive(Debug)]
 pub struct Shared;
 
+/// Type for specifying an AppSlice is shared read-only with the kernel.
+#[derive(Debug)]
+pub struct SharedRO;
+
+pub trait Read {}
+impl Read for Shared {}
+impl Read for SharedRO {}
+
 /// Base type for an AppSlice that holds the raw pointer to the memory region
 /// the app shared with the kernel.
 pub struct AppPtr<L, T> {
@@ -34,7 +42,16 @@ impl<L, T> AppPtr<L, T> {
     }
 }
 
-impl<L, T> Deref for AppPtr<L, T> {
+impl<L: Read, T> AppPtr<L, T> {
+    pub fn make_read_only(self) -> AppPtr<SharedRO, T> {
+        unsafe { AppPtr::new(self.ptr, self.process) }
+    }
+}
+
+pub trait ReadWrite: Read {}
+impl ReadWrite for Shared {}
+
+impl<L: Read, T> Deref for AppPtr<L, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -42,7 +59,7 @@ impl<L, T> Deref for AppPtr<L, T> {
     }
 }
 
-impl<L, T> DerefMut for AppPtr<L, T> {
+impl<L: ReadWrite, T> DerefMut for AppPtr<L, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { self.ptr.as_mut() }
     }
@@ -103,17 +120,28 @@ impl<L, T> AppSlice<L, T> {
             false
         }
     }
+}
+
+impl<L: Read, T> AppSlice<L, T> {
+    pub fn make_read_only(self) -> AppSlice<SharedRO, T> {
+        AppSlice {
+            ptr: self.ptr.make_read_only(),
+            len: self.len,
+        }
+    }
 
     pub fn iter(&self) -> slice::Iter<T> {
         self.as_ref().iter()
     }
 
-    pub fn iter_mut(&mut self) -> slice::IterMut<T> {
-        self.as_mut().iter_mut()
-    }
-
     pub fn chunks(&self, size: usize) -> slice::Chunks<T> {
         self.as_ref().chunks(size)
+    }
+}
+
+impl<L: ReadWrite, T> AppSlice<L, T> {
+    pub fn iter_mut(&mut self) -> slice::IterMut<T> {
+        self.as_mut().iter_mut()
     }
 
     pub fn chunks_mut(&mut self, size: usize) -> slice::ChunksMut<T> {
@@ -121,14 +149,14 @@ impl<L, T> AppSlice<L, T> {
     }
 }
 
-impl<L, T> AsRef<[T]> for AppSlice<L, T> {
+impl<L: Read, T> AsRef<[T]> for AppSlice<L, T> {
     fn as_ref(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.ptr.ptr.as_ref(), self.len) }
+        unsafe { slice::from_raw_parts(&*self.ptr, self.len) }
     }
 }
 
-impl<L, T> AsMut<[T]> for AppSlice<L, T> {
+impl<L: ReadWrite, T> AsMut<[T]> for AppSlice<L, T> {
     fn as_mut(&mut self) -> &mut [T] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.ptr.as_mut(), self.len) }
+        unsafe { slice::from_raw_parts_mut(&mut *self.ptr, self.len) }
     }
 }

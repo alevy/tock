@@ -525,6 +525,42 @@ impl Kernel {
                                     }
                                     process.set_syscall_return_value(res.into());
                                 }
+                                Syscall::ALLOWRO {
+                                    driver_number,
+                                    subdriver_number,
+                                    allow_address,
+                                    allow_size,
+                                } => {
+                                    let res = platform.with_driver(driver_number, |driver| {
+                                        match driver {
+                                            Some(d) => {
+                                                match process.allow_read(allow_address, allow_size)
+                                                {
+                                                    Ok(oslice) => d.allow_read(
+                                                        process.appid(),
+                                                        subdriver_number,
+                                                        oslice,
+                                                    ),
+                                                    Err(err) => err, /* memory not valid */
+                                                }
+                                            }
+                                            None => ReturnCode::ENODEVICE,
+                                        }
+                                    });
+                                    if config::CONFIG.trace_syscalls {
+                                        debug!(
+                                            "[{:?}] allow_read({:#x}, {}, @{:#x}, {:#x}) = {:#x} = {:?}",
+                                            process.appid(),
+                                            driver_number,
+                                            subdriver_number,
+                                            allow_address as usize,
+                                            allow_size,
+                                            usize::from(res),
+                                            res
+                                        );
+                                    }
+                                    process.set_syscall_return_value(res.into());
+                                }
                             }
                         }
                         Some(ContextSwitchReason::TimesliceExpired) => {

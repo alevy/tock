@@ -37,7 +37,7 @@
 use core::cmp;
 use kernel::common::cells::{OptionalCell, TakeCell};
 use kernel::hil::uart;
-use kernel::{AppId, AppSlice, Callback, Driver, Grant, ReturnCode, Shared};
+use kernel::{AppId, AppSlice, Callback, Driver, Grant, ReturnCode, Shared, SharedRO};
 
 /// Syscall driver number.
 use crate::driver;
@@ -46,7 +46,7 @@ pub const DRIVER_NUM: usize = driver::NUM::Console as usize;
 #[derive(Default)]
 pub struct App {
     write_callback: Option<Callback>,
-    write_buffer: Option<AppSlice<Shared, u8>>,
+    write_buffer: Option<AppSlice<SharedRO, u8>>,
     write_len: usize,
     write_remaining: usize, // How many bytes didn't fit in the buffer and still need to be printed.
     pending_write: bool,
@@ -115,7 +115,7 @@ impl Console<'a> {
 
     /// Internal helper function for sending data for an existing transaction.
     /// Cannot fail. If can't send now, it will schedule for sending later.
-    fn send(&self, app_id: AppId, app: &mut App, slice: AppSlice<Shared, u8>) {
+    fn send(&self, app_id: AppId, app: &mut App, slice: AppSlice<SharedRO, u8>) {
         if self.tx_in_progress.is_none() {
             self.tx_in_progress.set(app_id);
             self.tx_buffer.take().map(|buffer| {
@@ -186,7 +186,7 @@ impl Driver for Console<'a> {
     ///
     /// ### `allow_num`
     ///
-    /// - `1`: Writeable buffer for write buffer
+    /// - `1`: Readable buffer for write buffer
     /// - `2`: Writeable buffer for read buffer
     fn allow(
         &self,
@@ -195,17 +195,35 @@ impl Driver for Console<'a> {
         slice: Option<AppSlice<Shared, u8>>,
     ) -> ReturnCode {
         match allow_num {
-            1 => self
-                .apps
-                .enter(appid, |app, _| {
-                    app.write_buffer = slice;
-                    ReturnCode::SUCCESS
-                })
-                .unwrap_or_else(|err| err.into()),
+            1 => self.allow_read(appid, allow_num, slice.map(|s| s.make_read_only())),
             2 => self
                 .apps
                 .enter(appid, |app, _| {
                     app.read_buffer = slice;
+                    ReturnCode::SUCCESS
+                })
+                .unwrap_or_else(|err| err.into()),
+            _ => ReturnCode::ENOSUPPORT,
+        }
+    }
+
+    /// Setup shared buffers.
+    ///
+    /// ### `allow_num`
+    ///
+    /// - `1`: Readable buffer for write buffer
+    /// - `2`: Writeable buffer for read buffer
+    fn allow_read(
+        &self,
+        appid: AppId,
+        allow_num: usize,
+        slice: Option<AppSlice<SharedRO, u8>>,
+    ) -> ReturnCode {
+        match allow_num {
+            1 => self
+                .apps
+                .enter(appid, |app, _| {
+                    app.write_buffer = slice;
                     ReturnCode::SUCCESS
                 })
                 .unwrap_or_else(|err| err.into()),
