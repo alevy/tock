@@ -33,10 +33,20 @@ pub enum Syscall {
         arg1: usize,
     },
 
-    /// Share a memory buffer with the kernel.
+    /// Share a memory buffer read-write with the kernel.
     ///
     /// SVC_NUM = 3
     ALLOW {
+        driver_number: usize,
+        subdriver_number: usize,
+        allow_address: *mut u8,
+        allow_size: usize,
+    },
+
+    /// Share a memory buffer read-only with the kernel.
+    ///
+    /// SVC_NUM = 5
+    ALLOWRO {
         driver_number: usize,
         subdriver_number: usize,
         allow_address: *mut u8,
