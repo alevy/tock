@@ -17,7 +17,7 @@
 use crate::callback::AppId;
 use crate::common::list::{List, ListLink, ListNode};
 use crate::hil::time;
-use crate::hil::time::Frequency;
+use crate::hil::time::{Frequency, Ticks};
 use crate::platform::Chip;
 use crate::sched::{Kernel, Scheduler, SchedulingDecision, StoppedExecutingReason};
 use core::cell::Cell;
@@ -138,10 +138,10 @@ impl<'a, A: 'static + time::Alarm<'static>, C: Chip> Scheduler<C> for MLFQSched<
             SchedulingDecision::TrySleep
         } else {
             let now = self.alarm.now();
-            if now >= self.next_reset.get() {
+            if now.into_u32() >= self.next_reset.get() {
                 // Promote all processes to highest priority queue
-                let delta = (Self::PRIORITY_REFRESH_PERIOD_MS * A::Frequency::frequency()) / 1000;
-                self.next_reset.set(now.wrapping_add(delta));
+                let delta = A::Ticks::from((Self::PRIORITY_REFRESH_PERIOD_MS * A::Frequency::frequency()) / 1000);
+                self.next_reset.set(now.wrapping_add(delta).into_u32());
                 self.redeem_all_procs();
             }
             let (node_ref_opt, queue_idx) = self.get_next_ready_process_node();
