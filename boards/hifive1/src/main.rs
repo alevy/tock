@@ -213,12 +213,19 @@ pub unsafe fn reset_handler() {
         static _eappmem: u8;
     }
 
+    let alarm_test_component =
+        components::test::multi_alarm_test::MultiAlarmTestComponent::new(mux_alarm).finalize(
+            components::multi_alarm_test_component_buf!(rv32i::machine_timer::MachineTimer),
+        );
+
     let hifive1 = HiFive1 {
         console: console,
         alarm: alarm,
         lldb: lldb,
         led,
     };
+
+    alarm_test_component.run();
 
     kernel::procs::load_processes(
         board_kernel,

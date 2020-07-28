@@ -3,7 +3,8 @@
 use kernel::common::cells::OptionalCell;
 use kernel::common::registers::{register_bitfields, register_structs, ReadWrite, WriteOnly};
 use kernel::common::StaticRef;
-use kernel::hil::time;
+use kernel::hil::time::{self, Ticks, Time};
+use kernel::ReturnCode;
 
 use crate::chip::CHIP_FREQ;
 
@@ -81,48 +82,60 @@ impl<'a> RvTimer<'a> {
         regs.intr_enable.write(intr::timer0::CLEAR);
         regs.intr_state.write(intr::timer0::SET);
         self.client.map(|client| {
-            client.fired();
+            client.alarm();
         });
     }
 }
 
-impl time::Time for RvTimer<'_> {
+impl Time for RvTimer<'_> {
     type Frequency = Freq10KHz;
+    type Ticks = time::Ticks32;
 
-    fn now(&self) -> u32 {
-        self.registers.value_low.get()
-    }
-    fn max_tics(&self) -> u32 {
-        core::u32::MAX
+    fn now(&self) -> Self::Ticks {
+        Self::Ticks::from(self.registers.value_low.get())
     }
 }
 
 impl<'a> time::Alarm<'a> for RvTimer<'a> {
-    fn set_client(&self, client: &'a dyn time::AlarmClient) {
+    fn set_alarm_client(&self, client: &'a dyn time::AlarmClient) {
         self.client.set(client);
     }
 
-    fn set_alarm(&self, tics: u32) {
+    fn set_alarm(&self, reference: Self::Ticks, dt: Self::Ticks) {
         let regs = self.registers;
 
         // Make sure that any overlow into the high bits of the timer (which we are ignoring for
         // now) do not have an effect on the alarm.
         regs.value_high.set(0);
 
-        regs.compare_low.set(tics);
+        let now = self.now();
+        let mut expire = reference.wrapping_add(dt);
+        if !now.within_range(reference, expire) {
+            // We have already passed when: just fire ASAP
+            // Note this will also trigger the increment below
+            //debug!("  - set to fire ASAP");
+            expire = now.wrapping_add(self.minimum_dt());
+        }
+
+        regs.compare_low.set(expire.into_u32());
         regs.intr_enable.write(intr::timer0::SET);
     }
 
-    fn get_alarm(&self) -> u32 {
-        self.registers.compare_low.get()
+    fn get_alarm(&self) -> Self::Ticks {
+        Self::Ticks::from(self.registers.compare_low.get())
     }
 
-    fn disable(&self) {
+    fn disarm(&self) -> ReturnCode {
         self.registers.intr_enable.write(intr::timer0::CLEAR);
+        ReturnCode::SUCCESS
     }
 
-    fn is_enabled(&self) -> bool {
+    fn is_armed(&self) -> bool {
         self.registers.intr_enable.is_set(intr::timer0)
+    }
+
+    fn minimum_dt(&self) -> Self::Ticks {
+        Self::Ticks::from(10) // TODO(alevy): why 10?
     }
 }
 
