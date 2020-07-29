@@ -10,7 +10,7 @@ flash: $(TOCK_ROOT_DIRECTORY)target/$(TARGET)/release/$(PLATFORM).elf
 		-c "source [find board/sifive-hifive1.cfg]; program $<; resume 0x20000000; exit"
 
 qemu: $(TOCK_ROOT_DIRECTORY)target/$(TARGET)/release/$(PLATFORM).elf
-	qemu-system-riscv32 -M sifive_e,revb=true -kernel $^  -nographic
+	qemu-system-riscv32 -M sifive_e,revb=true -kernel $^  -nographic -serial mon:stdio
 
 qemu-app: $(TOCK_ROOT_DIRECTORY)target/$(TARGET)/release/$(PLATFORM).elf
 	qemu-system-riscv32 -M sifive_e,revb=true -kernel $^ -device loader,file=$(APP),addr=0x20040000 -nographic

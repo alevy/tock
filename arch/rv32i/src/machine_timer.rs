@@ -5,7 +5,7 @@ use kernel::common::cells::OptionalCell;
 use kernel::common::registers::{register_bitfields, ReadOnly, ReadWrite};
 use kernel::common::StaticRef;
 use kernel::hil::time::{self, Alarm, Frequency, Ticks, Time};
-use kernel::ReturnCode;
+use kernel::{debug, ReturnCode};
 
 #[repr(C)]
 pub struct MachineTimerRegisters {
@@ -82,7 +82,7 @@ impl<'a> time::Alarm<'a> for MachineTimer<'a> {
             // expire has already passed, so fire immediately
             // TODO(alevy): we probably need some wiggle room, but
             //              I can't trivially figure out how much
-            expire = now;
+            expire = now.wrapping_add(Self::Ticks::from(100u64));
         }
 
         self.registers

@@ -15,6 +15,7 @@
 with builtins;
 let
   inherit (pkgs) stdenv;
+  bleeding = import (../nixpkgs) {};
   pythonPackages = stdenv.lib.fix' (self: with self; pkgs.python3Packages //
   {
 
@@ -50,7 +51,7 @@ in
       pythonPackages.tockloader
       rust_build
       llvm
-      qemu
+      bleeding.qemu
     ];
 
     LD_LIBRARY_PATH="${stdenv.cc.cc.lib}/lib64:$LD_LIBRARY_PATH";
