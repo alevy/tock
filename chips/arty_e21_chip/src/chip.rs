@@ -71,7 +71,7 @@ impl<'a> InterruptService for ArtyExxDefaultPeripherals<'a> {
             interrupts::GPIO14 => self.gpio_port[14].handle_interrupt(),
             interrupts::GPIO15 => self.gpio_port[15].handle_interrupt(),
 
-            interrupts::UART0 => self.uart0.handle_interrupt(),
+            //interrupts::UART0 => self.uart0.handle_interrupt(),
 
             _ => return false,
         }

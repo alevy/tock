@@ -78,7 +78,7 @@ use kernel::hil::time::Counter;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
-use kernel::{capabilities, create_capability, debug, debug_gpio, debug_verbose, static_init};
+use kernel::{capabilities, create_capability, static_init};
 use nrf52832::gpio::Pin;
 use nrf52832::interrupt_service::Nrf52832DefaultPeripherals;
 use nrf52832::rtc::Rtc;
@@ -145,12 +145,12 @@ pub struct Platform {
         VirtualMuxAlarm<'static, Rtc<'static>>,
     >,
     button: &'static capsules_core::button::Button<'static, nrf52832::gpio::GPIOPin<'static>>,
-    pconsole: &'static capsules_core::process_console::ProcessConsole<
+    /*pconsole: &'static capsules_core::process_console::ProcessConsole<
         'static,
         { capsules_core::process_console::DEFAULT_COMMAND_HISTORY_LEN },
         VirtualMuxAlarm<'static, Rtc<'static>>,
         components::process_console::Capability,
-    >,
+    >,*/
     console: &'static capsules_core::console::Console<'static>,
     gpio: &'static capsules_core::gpio::GPIO<'static, nrf52832::gpio::GPIOPin<'static>>,
     led: &'static capsules_core::led::LedDriver<
@@ -348,11 +348,11 @@ pub unsafe fn main() {
 
     let gpio_port = &nrf52832_peripherals.gpio_port;
     // Configure kernel debug gpios as early as possible
-    kernel::debug::assign_gpios(
+    /*kernel::debug::assign_gpios(
         Some(&gpio_port[LED1_PIN]),
         Some(&gpio_port[LED2_PIN]),
         Some(&gpio_port[LED3_PIN]),
-    );
+    );*/
 
     let rtc = &base_peripherals.rtc;
     let _ = rtc.start();
@@ -382,14 +382,14 @@ pub unsafe fn main() {
     let uart_mux = components::console::UartMuxComponent::new(channel, 115200)
         .finalize(components::uart_mux_component_static!());
 
-    let pconsole = components::process_console::ProcessConsoleComponent::new(
+    /*let pconsole = components::process_console::ProcessConsoleComponent::new(
         board_kernel,
         uart_mux,
         mux_alarm,
         process_printer,
         Some(cortexm4::support::reset),
     )
-    .finalize(components::process_console_component_static!(Rtc<'static>));
+    .finalize(components::process_console_component_static!(Rtc<'static>));*/
 
     // Setup the console.
     let console = components::console::ConsoleComponent::new(
@@ -399,8 +399,6 @@ pub unsafe fn main() {
     )
     .finalize(components::console_component_static!());
     // Create the debugger object that handles calls to `debug!()`.
-    components::debug_writer::DebugWriterComponent::new(uart_mux)
-        .finalize(components::debug_writer_component_static!());
 
     let ble_radio = components::ble::BLEComponent::new(
         board_kernel,
@@ -452,7 +450,7 @@ pub unsafe fn main() {
     let platform = Platform {
         button,
         ble_radio,
-        pconsole,
+        //pconsole,
         console,
         led,
         gpio,
@@ -469,9 +467,7 @@ pub unsafe fn main() {
         systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
     };
 
-    let _ = platform.pconsole.start();
-    debug!("Initialization complete. Entering main loop\r");
-    debug!("{}", &nrf52832::ficr::FICR_INSTANCE);
+    //let _ = platform.pconsole.start();
 
     // These symbols are defined in the linker script.
     extern "C" {
@@ -501,8 +497,6 @@ pub unsafe fn main() {
         &process_management_capability,
     )
     .unwrap_or_else(|err| {
-        debug!("Error loading processes!");
-        debug!("{:?}", err);
     });
 
     board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);

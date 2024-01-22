@@ -683,6 +683,28 @@ pub enum TbfHeader {
     Padding(TbfHeaderV2Base),
 }
 
+impl Default for TbfHeader {
+    fn default() -> Self {
+        TbfHeader::TbfHeaderV2(TbfHeaderV2 {
+            base: TbfHeaderV2Base {
+                version: 0,
+                header_size: 0,
+                total_size: 0,
+                flags: 0,
+                checksum: 0,
+            },
+            main: None,
+            program: None,
+            package_name: None,
+            writeable_regions: None,
+            fixed_addresses: None,
+            permissions: None,
+            storage_permissions: None,
+            kernel_version: None,
+        })
+    }
+}
+
 impl TbfHeader {
     /// Return the length of the header.
     pub fn length(&self) -> u16 {

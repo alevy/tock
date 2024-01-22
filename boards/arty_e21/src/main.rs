@@ -38,7 +38,7 @@ static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; NUM_PROCS]
 
 // Reference to the chip for panic dumps.
 static mut CHIP: Option<&'static arty_e21_chip::chip::ArtyExx<ArtyExxDefaultPeripherals>> = None;
-static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
+//static mut PROCESS_PRINTER: Option<&'static kernel::process::ProcessPrinterText> = None;
 
 /// Dummy buffer that causes the linker to reserve enough space for the stack.
 #[no_mangle]
@@ -47,8 +47,8 @@ pub static mut STACK_MEMORY: [u8; 0x1000] = [0; 0x1000];
 
 /// A structure representing this platform that holds references to all
 /// capsules for this platform.
-struct ArtyE21 {
-    console: &'static capsules_core::console::Console<'static>,
+struct ArtyE21<S> {
+    //console: &'static capsules_core::console::Console<'static>,
     gpio: &'static capsules_core::gpio::GPIO<'static, arty_e21_chip::gpio::GpioPin<'static>>,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
@@ -61,17 +61,17 @@ struct ArtyE21 {
     >,
     button: &'static capsules_core::button::Button<'static, arty_e21_chip::gpio::GpioPin<'static>>,
     // ipc: kernel::ipc::IPC<NUM_PROCS>,
-    scheduler: &'static PrioritySched,
+    scheduler: S,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
-impl SyscallDriverLookup for ArtyE21 {
+impl<S> SyscallDriverLookup for ArtyE21<S> {
     fn with_driver<F, R>(&self, driver_num: usize, f: F) -> R
     where
         F: FnOnce(Option<&dyn kernel::syscall::SyscallDriver>) -> R,
     {
         match driver_num {
-            capsules_core::console::DRIVER_NUM => f(Some(self.console)),
+            //capsules_core::console::DRIVER_NUM => f(Some(self.console)),
             capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
 
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
@@ -84,14 +84,14 @@ impl SyscallDriverLookup for ArtyE21 {
     }
 }
 
-impl KernelResources<arty_e21_chip::chip::ArtyExx<'static, ArtyExxDefaultPeripherals<'static>>>
-    for ArtyE21
+impl<S: kernel::Scheduler<arty_e21_chip::chip::ArtyExx<'static, arty_e21_chip::chip::ArtyExxDefaultPeripherals<'static>>>> KernelResources<arty_e21_chip::chip::ArtyExx<'static, ArtyExxDefaultPeripherals<'static>>>
+    for ArtyE21<S>
 {
     type SyscallDriverLookup = Self;
     type SyscallFilter = ();
     type ProcessFault = ();
     type CredentialsCheckingPolicy = ();
-    type Scheduler = PrioritySched;
+    type Scheduler = S;
     type SchedulerTimer = ();
     type WatchDog = ();
     type ContextSwitchCallback = ();
@@ -109,7 +109,7 @@ impl KernelResources<arty_e21_chip::chip::ArtyExx<'static, ArtyExxDefaultPeriphe
         &()
     }
     fn scheduler(&self) -> &Self::Scheduler {
-        self.scheduler
+        &self.scheduler
     }
     fn scheduler_timer(&self) -> &Self::SchedulerTimer {
         &()
@@ -144,13 +144,13 @@ pub unsafe fn main() {
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
 
     // Configure kernel debug gpios as early as possible
-    kernel::debug::assign_gpios(
-        Some(&peripherals.gpio_port[0]), // Blue
-        Some(&peripherals.gpio_port[1]), // Green
-        Some(&peripherals.gpio_port[8]),
-    );
+    //kernel::debug::assign_gpios(
+    //    Some(&peripherals.gpio_port[0]), // Blue
+    //    Some(&peripherals.gpio_port[1]), // Green
+    //    Some(&peripherals.gpio_port[8]),
+    //);
 
-    let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
+    /*let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
         .finalize(components::process_printer_text_component_static!());
     PROCESS_PRINTER = Some(process_printer);
 
@@ -164,6 +164,7 @@ pub unsafe fn main() {
         uart_mux,
     )
     .finalize(components::console_component_static!());
+    */
 
     // Create a shared virtualization mux layer on top of a single hardware
     // alarm.
@@ -237,11 +238,11 @@ pub unsafe fn main() {
 
     chip.enable_all_interrupts();
 
-    let scheduler = components::sched::priority::PriorityComponent::new(board_kernel)
-        .finalize(components::priority_component_static!());
+
+    let scheduler = PrioritySched::new(board_kernel);
 
     let artye21 = ArtyE21 {
-        console: console,
+        //console: console,
         gpio: gpio,
         alarm: alarm,
         led: led,
@@ -251,12 +252,12 @@ pub unsafe fn main() {
     };
 
     // Create virtual device for kernel debug.
-    components::debug_writer::DebugWriterComponent::new(uart_mux)
-        .finalize(components::debug_writer_component_static!());
+    //components::debug_writer::DebugWriterComponent::new(uart_mux)
+    //    .finalize(components::debug_writer_component_static!());
 
     // arty_e21_chip::uart::UART0.initialize_gpio_pins(&peripherals.gpio_port[17], &peripherals.gpio_port[16]);
 
-    debug!("Initialization complete. Entering main loop.");
+    //debug!("Initialization complete. Entering main loop.");
 
     // Uncomment to run tests
     //timertest.start();
@@ -292,8 +293,8 @@ pub unsafe fn main() {
         &process_mgmt_cap,
     )
     .unwrap_or_else(|err| {
-        debug!("Error loading processes!");
-        debug!("{:?}", err);
+        //debug!("Error loading processes!");
+        //debug!("{:?}", err);
     });
 
     board_kernel.kernel_loop(&artye21, chip, None::<&kernel::ipc::IPC<0>>, &main_loop_cap);

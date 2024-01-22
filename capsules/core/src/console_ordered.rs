@@ -72,7 +72,7 @@
 use core::cell::Cell;
 use core::cmp;
 
-use kernel::debug::debug_available_len;
+//use kernel::debug::debug_available_len;
 use kernel::debug_process_slice;
 
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, GrantKernelData, UpcallCount};
@@ -203,7 +203,7 @@ impl<'a, A: Alarm<'a>> ConsoleOrdered<'a, A> {
         app.tx_counter = self.tx_counter.get();
         self.tx_counter.set(app.tx_counter.wrapping_add(1));
 
-        let debug_space_avail = debug_available_len();
+        let debug_space_avail = 0;//debug_available_len();
 
         if self.tx_in_progress.get() {
             // A prior print is outstanding, enqueue
@@ -244,7 +244,7 @@ impl<'a, A: Alarm<'a>> ConsoleOrdered<'a, A> {
                     // The slice might have become shorter than the requested
                     // write; if so, just write what there is.
                     let remaining_len = app.write_len - app.write_position;
-                    let real_write_len = cmp::min(remaining_len, debug_available_len());
+                    let real_write_len = cmp::min(remaining_len, 0);//debug_available_len());
                     let this_write_end = app.write_position + real_write_len;
                     let remaining_data = match data.get(app.write_position..this_write_end) {
                         Some(remaining_data) => remaining_data,
@@ -254,8 +254,9 @@ impl<'a, A: Alarm<'a>> ConsoleOrdered<'a, A> {
                     app.writing = true;
                     self.tx_in_progress.set(true);
                     if real_write_len > 0 {
-                        let count = debug_process_slice!(remaining_data);
-                        count
+                        //let count = debug_process_slice!(remaining_data);
+                        //count
+                        0
                     } else {
                         0
                     }
@@ -337,7 +338,7 @@ impl<'a, A: Alarm<'a>> AlarmClient for ConsoleOrdered<'a, A> {
 
                             // Promise to write to the end, or the atomic write unit, whichever is smaller
                             let remaining_len = app.write_len - app.write_position;
-                            let debug_space_avail = debug_available_len();
+                            let debug_space_avail = 0;//debug_available_len();
                             let minimum_write = cmp::min(remaining_len, self.atomic_size.get());
 
                             // Write, or if there isn't space for a minimum write, retry later

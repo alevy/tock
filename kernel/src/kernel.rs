@@ -740,7 +740,7 @@ impl Kernel {
     /// `Exit`, dispatches `Memop` to `memop::memop`, and dispatches peripheral
     /// driver system calls to peripheral driver capsules through the platforms
     /// `with_driver` method.
-    #[inline]
+    #[inline(always)]
     fn handle_syscall<KR: KernelResources<C>, C: Chip>(
         &self,
         resources: &KR,

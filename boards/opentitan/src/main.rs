@@ -85,46 +85,6 @@ const NUM_PROCS: usize = 4;
 // at least.
 static mut PROCESSES: [Option<&'static dyn kernel::process::Process>; 4] = [None; NUM_PROCS];
 
-// Test access to the peripherals
-#[cfg(test)]
-static mut PERIPHERALS: Option<&'static EarlGreyDefaultPeripherals<ChipConfig, BoardPinmuxLayout>> =
-    None;
-// Test access to board
-#[cfg(test)]
-static mut BOARD: Option<&'static kernel::Kernel> = None;
-// Test access to platform
-#[cfg(test)]
-static mut PLATFORM: Option<&'static EarlGrey> = None;
-// Test access to main loop capability
-#[cfg(test)]
-static mut MAIN_CAP: Option<&dyn kernel::capabilities::MainLoopCapability> = None;
-// Test access to alarm
-static mut ALARM: Option<
-    &'static MuxAlarm<'static, earlgrey::timer::RvTimer<'static, ChipConfig>>,
-> = None;
-// Test access to TicKV
-static mut TICKV: Option<
-    &capsules_extra::tickv::TicKVSystem<
-        'static,
-        capsules_core::virtualizers::virtual_flash::FlashUser<
-            'static,
-            lowrisc::flash_ctrl::FlashCtrl<'static>,
-        >,
-        capsules_extra::sip_hash::SipHasher24<'static>,
-        2048,
-    >,
-> = None;
-// Test access to AES
-static mut AES: Option<
-    &aes_gcm::Aes128Gcm<
-        'static,
-        virtual_aes_ccm::VirtualAES128CCM<'static, earlgrey::aes::Aes<'static>>,
-    >,
-> = None;
-// Test access to SipHash
-static mut SIPHASH: Option<&capsules_extra::sip_hash::SipHasher24<'static>> = None;
-// Test access to RSA
-static mut RSA_HARDWARE: Option<&lowrisc::rsa::OtbnRsa<'static>> = None;
 
 // Test access to a software SHA256
 #[cfg(test)]
@@ -165,10 +125,6 @@ struct EarlGrey {
         VirtualMuxAlarm<'static, earlgrey::timer::RvTimer<'static, ChipConfig>>,
     >,
     hmac: &'static capsules_extra::hmac::HmacDriver<'static, lowrisc::hmac::Hmac<'static>, 32>,
-    lldb: &'static capsules_core::low_level_debug::LowLevelDebug<
-        'static,
-        capsules_core::virtualizers::virtual_uart::UartDevice<'static>,
-    >,
     i2c_master:
         &'static capsules_core::i2c_master::I2CMasterDriver<'static, lowrisc::i2c::I2c<'static>>,
     spi_controller: &'static capsules_core::spi_controller::Spi<
@@ -186,7 +142,7 @@ struct EarlGrey {
             virtual_aes_ccm::VirtualAES128CCM<'static, earlgrey::aes::Aes<'static>>,
         >,
     >,
-    kv_driver: &'static capsules_extra::kv_driver::KVStoreDriver<
+    /*kv_driver: &'static capsules_extra::kv_driver::KVStoreDriver<
         'static,
         capsules_extra::virtual_kv::VirtualKVPermissions<
             'static,
@@ -207,7 +163,7 @@ struct EarlGrey {
                 >,
             >,
         >,
-    >,
+    >,*/
     syscall_filter: &'static TbfHeaderFilterDefaultAllow,
     scheduler: &'static PrioritySched,
     scheduler_timer: &'static VirtualSchedulerTimer<
@@ -228,12 +184,11 @@ impl SyscallDriverLookup for EarlGrey {
             capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
-            capsules_core::low_level_debug::DRIVER_NUM => f(Some(self.lldb)),
             capsules_core::i2c_master::DRIVER_NUM => f(Some(self.i2c_master)),
             capsules_core::spi_controller::DRIVER_NUM => f(Some(self.spi_controller)),
             capsules_core::rng::DRIVER_NUM => f(Some(self.rng)),
             capsules_extra::symmetric_encryption::aes::DRIVER_NUM => f(Some(self.aes)),
-            capsules_extra::kv_driver::DRIVER_NUM => f(Some(self.kv_driver)),
+            //capsules_extra::kv_driver::DRIVER_NUM => f(Some(self.kv_driver)),
             _ => f(None),
         }
     }
@@ -315,12 +270,6 @@ unsafe fn setup() -> (
     );
     peripherals.init();
 
-    // Configure kernel debug gpios as early as possible
-    kernel::debug::assign_gpios(
-        Some(&peripherals.gpio_port[7]), // First LED
-        None,
-        None,
-    );
 
     // Create a shared UART channel for the console and for kernel debug.
     let uart_mux =
@@ -374,7 +323,6 @@ unsafe fn setup() -> (
     );
     hil::time::Alarm::set_alarm_client(hardware_alarm, mux_alarm);
 
-    ALARM = Some(mux_alarm);
 
     // Alarm
     let virtual_alarm_user = static_init!(
@@ -433,16 +381,6 @@ unsafe fn setup() -> (
         uart_mux,
     )
     .finalize(components::console_component_static!());
-    // Create the debugger object that handles calls to `debug!()`.
-    components::debug_writer::DebugWriterComponent::new(uart_mux)
-        .finalize(components::debug_writer_component_static!());
-
-    let lldb = components::lldb::LowLevelDebugComponent::new(
-        board_kernel,
-        capsules_core::low_level_debug::DRIVER_NUM,
-        uart_mux,
-    )
-    .finalize(components::low_level_debug_component_static!());
 
     let hmac = components::hmac::HmacComponent::new(
         board_kernel,
@@ -551,26 +489,8 @@ unsafe fn setup() -> (
         capsules_extra::sip_hash::SipHasher24::new()
     );
     kernel::deferred_call::DeferredCallClient::register(sip_hash);
-    SIPHASH = Some(sip_hash);
 
-    // TicKV
-    let tickv = components::tickv::TicKVComponent::new(
-        sip_hash,
-        mux_flash,                                     // Flash controller
-        lowrisc::flash_ctrl::FLASH_PAGES_PER_BANK - 1, // Region offset (End of Bank0/Use Bank1)
-        // Region Size
-        lowrisc::flash_ctrl::FLASH_PAGES_PER_BANK * lowrisc::flash_ctrl::PAGE_SIZE,
-        flash_ctrl_read_buf, // Buffer used internally in TicKV
-        page_buffer,         // Buffer used with the flash controller
-    )
-    .finalize(components::tickv_component_static!(
-        lowrisc::flash_ctrl::FlashCtrl,
-        capsules_extra::sip_hash::SipHasher24,
-        2048
-    ));
-    hil::flash::HasClient::set_client(&peripherals.flash_ctrl, mux_flash);
-    sip_hash.set_client(tickv);
-    TICKV = Some(tickv);
+    /*TICKV = Some(tickv);
 
     let kv_store = components::kv::TicKVKVStoreComponent::new(tickv).finalize(
         components::tickv_kv_store_component_static!(
@@ -654,7 +574,7 @@ unsafe fn setup() -> (
                 >,
             >,
         >
-    ));
+    ));*/
 
     let mux_otbn = crate::otbn::AccelMuxComponent::new(&peripherals.otbn)
         .finalize(otbn_mux_component_static!());
@@ -687,7 +607,6 @@ unsafe fn setup() -> (
             )
         );
         peripherals.otbn.set_client(rsa_hardware);
-        RSA_HARDWARE = Some(rsa_hardware);
     } else {
         debug!("Unable to find otbn-rsa, disabling RSA support");
     }
@@ -743,7 +662,6 @@ unsafe fn setup() -> (
         >,
     ));
 
-    AES = Some(gcm_client);
 
     #[cfg(test)]
     {
@@ -804,11 +722,10 @@ unsafe fn setup() -> (
             alarm,
             hmac,
             rng,
-            lldb: lldb,
             i2c_master,
             spi_controller,
             aes,
-            kv_driver,
+            //kv_driver,
             syscall_filter,
             scheduler,
             scheduler_timer,
@@ -816,7 +733,7 @@ unsafe fn setup() -> (
         }
     );
 
-    let mut mpu_config = rv32i::epmp::PMPConfig::kernel_default();
+    /*let mut mpu_config = rv32i::epmp::PMPConfig::kernel_default();
 
     // The kernel stack, BSS and relocation data
     chip.pmp
@@ -860,9 +777,9 @@ unsafe fn setup() -> (
         )
         .unwrap();
 
-    chip.pmp.enable_kernel_mpu(&mut mpu_config);
+    chip.pmp.enable_kernel_mpu(&mut mpu_config);*/
 
-    kernel::process::load_processes(
+    /*kernel::process::load_processes(
         board_kernel,
         chip,
         core::slice::from_raw_parts(
@@ -880,8 +797,8 @@ unsafe fn setup() -> (
     .unwrap_or_else(|err| {
         debug!("Error loading processes!");
         debug!("{:?}", err);
-    });
-    debug!("OpenTitan initialisation complete. Entering main loop");
+    });*/
+    //debug!("OpenTitan initialisation complete. Entering main loop");
 
     (board_kernel, earlgrey, chip, peripherals)
 }

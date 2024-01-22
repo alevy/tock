@@ -1229,7 +1229,7 @@ impl<C: Chip> Process for ProcessStandard<'_, C> {
     }
 
     fn print_full_process(&self, writer: &mut dyn Write) {
-        if !config::CONFIG.debug_panics {
+        /*if !config::CONFIG.debug_panics {
             return;
         }
 
@@ -1317,7 +1317,7 @@ impl<C: Chip> Process for ProcessStandard<'_, C> {
                     sram_start, flash_init_fn
                 ));
             }
-        });
+        });*/
     }
 
     fn get_stored_state(&self, out: &mut [u8]) -> Result<usize, ErrorCode> {

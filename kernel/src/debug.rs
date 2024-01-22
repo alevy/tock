@@ -52,7 +52,7 @@
 //! Yes the code gets here with value 42
 //! TOCK_DEBUG(0): /tock/capsules/src/sensys.rs:24: got here
 //! ```
-
+/*
 use core::cell::Cell;
 use core::fmt::{write, Arguments, Result, Write};
 use core::panic::PanicInfo;
@@ -618,19 +618,15 @@ pub fn debug_verbose_println(args: Arguments, file_line: &(&'static str, u32)) {
     let _ = writer.write_str("\r\n");
     writer.publish_bytes();
 }
-
+*/
 /// In-kernel `println()` debugging.
 #[macro_export]
 macro_rules! debug {
     () => ({
-        // Allow an empty debug!() to print the location when hit
-        debug!("")
     });
     ($msg:expr $(,)?) => ({
-        $crate::debug::debug_println(format_args!($msg));
     });
     ($fmt:expr, $($arg:tt)+) => ({
-        $crate::debug::debug_println(format_args!($fmt, $($arg)+));
     });
 }
 
@@ -697,6 +693,7 @@ macro_rules! debug_expr {
     };
 }
 
+/*
 pub trait Debug {
     fn write(&self, buf: &'static mut [u8], len: usize) -> usize;
 }
@@ -745,3 +742,4 @@ pub unsafe fn flush<W: Write + IoWrite>(writer: &mut W) {
         );
     }
 }
+*/

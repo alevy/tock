@@ -2,22 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-use arty_e21_chip;
-use core::fmt::Write;
+//use arty_e21_chip;
+//use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::str;
-use kernel::debug;
-use kernel::debug::IoWrite;
-use kernel::hil::gpio;
-use kernel::hil::led;
-use rv32i;
-use sifive;
+//use core::str;
+////use kernel::debug;
+////use kernel::debug::IoWrite;
+//use kernel::hil::gpio;
+//use kernel::hil::led;
+//use rv32i;
+//use sifive;
 
-use crate::CHIP;
-use crate::PROCESSES;
-use crate::PROCESS_PRINTER;
+//use crate::CHIP;
+//use crate::PROCESSES;
+//use crate::PROCESS_PRINTER;
 
-struct Writer {}
+/*struct Writer {}
 
 static mut WRITER: Writer = Writer {};
 
@@ -33,14 +33,15 @@ impl IoWrite for Writer {
         sifive::uart::Uart::new(arty_e21_chip::uart::UART0_BASE, 32_000_000).transmit_sync(buf);
         buf.len()
     }
-}
+}*/
 
 /// Panic handler.
 #[cfg(not(test))]
 #[no_mangle]
 #[panic_handler]
 pub unsafe extern "C" fn panic_fmt(pi: &PanicInfo) -> ! {
-    // turn off the non panic leds, just in case
+    loop {}
+    /*// turn off the non panic leds, just in case
     let led_green = &sifive::gpio::GpioPin::new(
         arty_e21_chip::gpio::GPIO0_BASE,
         sifive::gpio::pins::pin1,
@@ -76,5 +77,5 @@ pub unsafe extern "C" fn panic_fmt(pi: &PanicInfo) -> ! {
         &PROCESSES,
         &CHIP,
         &PROCESS_PRINTER,
-    )
+    )*/
 }

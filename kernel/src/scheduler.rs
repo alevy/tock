@@ -84,6 +84,28 @@ pub trait Scheduler<C: Chip> {
     }
 }
 
+pub struct NullScheduler {
+    pub kernel: &'static crate::kernel::Kernel,
+}
+
+impl<C: Chip> Scheduler<C> for NullScheduler {
+    fn next(&self) -> SchedulingDecision {
+        let next = self
+            .kernel
+            .get_process_iter()
+            .find(|&proc| proc.ready())
+            .map_or(None, |proc| Some(proc.processid()));
+
+        next.map_or(SchedulingDecision::TrySleep, |next| {
+            SchedulingDecision::RunProcess((next, None))
+        })
+    }
+
+    fn result(&self, _result: StoppedExecutingReason, _execution_time_us: Option<u32>) {
+       // noop
+    }
+}
+
 /// Enum representing the actions the scheduler can request in each call to
 /// `scheduler.next()`.
 #[derive(Copy, Clone)]
