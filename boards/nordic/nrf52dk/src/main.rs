@@ -139,32 +139,7 @@ type TemperatureDriver =
 
 /// Supported drivers by the platform
 pub struct Platform {
-    ble_radio: &'static capsules_extra::ble_advertising_driver::BLE<
-        'static,
-        nrf52832::ble_radio::Radio<'static>,
-        VirtualMuxAlarm<'static, Rtc<'static>>,
-    >,
-    button: &'static capsules_core::button::Button<'static, nrf52832::gpio::GPIOPin<'static>>,
-    /*pconsole: &'static capsules_core::process_console::ProcessConsole<
-        'static,
-        { capsules_core::process_console::DEFAULT_COMMAND_HISTORY_LEN },
-        VirtualMuxAlarm<'static, Rtc<'static>>,
-        components::process_console::Capability,
-    >,*/
     console: &'static capsules_core::console::Console<'static>,
-    gpio: &'static capsules_core::gpio::GPIO<'static, nrf52832::gpio::GPIOPin<'static>>,
-    led: &'static capsules_core::led::LedDriver<
-        'static,
-        LedLow<'static, nrf52832::gpio::GPIOPin<'static>>,
-        4,
-    >,
-    rng: &'static capsules_core::rng::RngDriver<'static>,
-    temp: &'static TemperatureDriver,
-    ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
-    analog_comparator: &'static capsules_extra::analog_comparator::AnalogComparator<
-        'static,
-        nrf52832::acomp::Comparator<'static>,
-    >,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
         capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<
@@ -183,15 +158,7 @@ impl SyscallDriverLookup for Platform {
     {
         match driver_num {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
-            capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
-            capsules_core::led::DRIVER_NUM => f(Some(self.led)),
-            capsules_core::button::DRIVER_NUM => f(Some(self.button)),
-            capsules_core::rng::DRIVER_NUM => f(Some(self.rng)),
-            capsules_extra::ble_advertising_driver::DRIVER_NUM => f(Some(self.ble_radio)),
-            capsules_extra::temperature::DRIVER_NUM => f(Some(self.temp)),
-            capsules_extra::analog_comparator::DRIVER_NUM => f(Some(self.analog_comparator)),
-            kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
     }
@@ -262,69 +229,6 @@ pub unsafe fn main() {
 
     let board_kernel = static_init!(kernel::Kernel, kernel::Kernel::new(&PROCESSES));
 
-    let gpio = components::gpio::GpioComponent::new(
-        board_kernel,
-        capsules_core::gpio::DRIVER_NUM,
-        components::gpio_component_helper!(
-            nrf52832::gpio::GPIOPin,
-            // Bottom right header on DK board
-            0 => &nrf52832_peripherals.gpio_port[Pin::P0_03],
-            1 => &nrf52832_peripherals.gpio_port[Pin::P0_04],
-            2 => &nrf52832_peripherals.gpio_port[Pin::P0_28],
-            3 => &nrf52832_peripherals.gpio_port[Pin::P0_29],
-            4 => &nrf52832_peripherals.gpio_port[Pin::P0_30],
-            5 => &nrf52832_peripherals.gpio_port[Pin::P0_31],
-            // Top mid header on DK board
-            6 => &nrf52832_peripherals.gpio_port[Pin::P0_12],
-            7 => &nrf52832_peripherals.gpio_port[Pin::P0_11],
-            // Top left header on DK board
-            8 => &nrf52832_peripherals.gpio_port[Pin::P0_27],
-            9 => &nrf52832_peripherals.gpio_port[Pin::P0_26],
-            10 => &nrf52832_peripherals.gpio_port[Pin::P0_02],
-            11 => &nrf52832_peripherals.gpio_port[Pin::P0_25]
-        ),
-    )
-    .finalize(components::gpio_component_static!(nrf52832::gpio::GPIOPin));
-
-    let button = components::button::ButtonComponent::new(
-        board_kernel,
-        capsules_core::button::DRIVER_NUM,
-        components::button_component_helper!(
-            nrf52832::gpio::GPIOPin,
-            (
-                &nrf52832_peripherals.gpio_port[BUTTON1_PIN],
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullUp
-            ), //13
-            (
-                &nrf52832_peripherals.gpio_port[BUTTON2_PIN],
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullUp
-            ), //14
-            (
-                &nrf52832_peripherals.gpio_port[BUTTON3_PIN],
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullUp
-            ), //15
-            (
-                &nrf52832_peripherals.gpio_port[BUTTON4_PIN],
-                kernel::hil::gpio::ActivationMode::ActiveLow,
-                kernel::hil::gpio::FloatingState::PullUp
-            ) //16
-        ),
-    )
-    .finalize(components::button_component_static!(
-        nrf52832::gpio::GPIOPin
-    ));
-
-    let led = components::led::LedsComponent::new().finalize(components::led_component_static!(
-        LedLow<'static, nrf52832::gpio::GPIOPin>,
-        LedLow::new(&nrf52832_peripherals.gpio_port[LED1_PIN]),
-        LedLow::new(&nrf52832_peripherals.gpio_port[LED2_PIN]),
-        LedLow::new(&nrf52832_peripherals.gpio_port[LED3_PIN]),
-        LedLow::new(&nrf52832_peripherals.gpio_port[LED4_PIN]),
-    ));
-
     let chip = static_init!(
         nrf52832::chip::NRF52<Nrf52832DefaultPeripherals>,
         nrf52832::chip::NRF52::new(nrf52832_peripherals)
@@ -346,14 +250,6 @@ pub unsafe fn main() {
     let main_loop_capability = create_capability!(capabilities::MainLoopCapability);
     let memory_allocation_capability = create_capability!(capabilities::MemoryAllocationCapability);
 
-    let gpio_port = &nrf52832_peripherals.gpio_port;
-    // Configure kernel debug gpios as early as possible
-    /*kernel::debug::assign_gpios(
-        Some(&gpio_port[LED1_PIN]),
-        Some(&gpio_port[LED2_PIN]),
-        Some(&gpio_port[LED3_PIN]),
-    );*/
-
     let rtc = &base_peripherals.rtc;
     let _ = rtc.start();
     let mux_alarm = components::alarm::AlarmMuxComponent::new(rtc)
@@ -374,22 +270,9 @@ pub unsafe fn main() {
         nrf52832::rtc::Rtc
     ));
 
-    let process_printer = components::process_printer::ProcessPrinterTextComponent::new()
-        .finalize(components::process_printer_text_component_static!());
-    PROCESS_PRINTER = Some(process_printer);
-
     // Create a shared UART channel for the console and for kernel debug.
     let uart_mux = components::console::UartMuxComponent::new(channel, 115200)
         .finalize(components::uart_mux_component_static!());
-
-    /*let pconsole = components::process_console::ProcessConsoleComponent::new(
-        board_kernel,
-        uart_mux,
-        mux_alarm,
-        process_printer,
-        Some(cortexm4::support::reset),
-    )
-    .finalize(components::process_console_component_static!(Rtc<'static>));*/
 
     // Setup the console.
     let console = components::console::ConsoleComponent::new(
@@ -400,69 +283,14 @@ pub unsafe fn main() {
     .finalize(components::console_component_static!());
     // Create the debugger object that handles calls to `debug!()`.
 
-    let ble_radio = components::ble::BLEComponent::new(
-        board_kernel,
-        capsules_extra::ble_advertising_driver::DRIVER_NUM,
-        &base_peripherals.ble_radio,
-        mux_alarm,
-    )
-    .finalize(components::ble_component_static!(
-        nrf52832::rtc::Rtc,
-        nrf52832::ble_radio::Radio
-    ));
-
-    let temp = components::temperature::TemperatureComponent::new(
-        board_kernel,
-        capsules_extra::temperature::DRIVER_NUM,
-        &base_peripherals.temp,
-    )
-    .finalize(components::temperature_component_static!(
-        nrf52832::temperature::Temp
-    ));
-
-    let rng = components::rng::RngComponent::new(
-        board_kernel,
-        capsules_core::rng::DRIVER_NUM,
-        &base_peripherals.trng,
-    )
-    .finalize(components::rng_component_static!());
-
-    // Initialize AC using AIN5 (P0.29) as VIN+ and VIN- as AIN0 (P0.02)
-    // These are hardcoded pin assignments specified in the driver
-    let analog_comparator = components::analog_comparator::AnalogComparatorComponent::new(
-        &base_peripherals.acomp,
-        components::analog_comparator_component_helper!(
-            nrf52832::acomp::Channel,
-            &nrf52832::acomp::CHANNEL_AC0
-        ),
-        board_kernel,
-        capsules_extra::analog_comparator::DRIVER_NUM,
-    )
-    .finalize(components::analog_comparator_component_static!(
-        nrf52832::acomp::Comparator
-    ));
-
     nrf52_components::NrfClockComponent::new(&base_peripherals.clock).finalize(());
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(&PROCESSES)
         .finalize(components::round_robin_component_static!(NUM_PROCS));
 
     let platform = Platform {
-        button,
-        ble_radio,
-        //pconsole,
         console,
-        led,
-        gpio,
-        rng,
-        temp,
         alarm,
-        analog_comparator,
-        ipc: kernel::ipc::IPC::new(
-            board_kernel,
-            kernel::ipc::DRIVER_NUM,
-            &memory_allocation_capability,
-        ),
         scheduler,
         systick: cortexm4::systick::SysTick::new_with_calibration(64000000),
     };
@@ -499,5 +327,5 @@ pub unsafe fn main() {
     .unwrap_or_else(|err| {
     });
 
-    board_kernel.kernel_loop(&platform, chip, Some(&platform.ipc), &main_loop_capability);
+    board_kernel.kernel_loop(&platform, chip, None::<&kernel::ipc::IPC<4>>, &main_loop_capability);
 }
