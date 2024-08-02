@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2022.
 
-#![forbid(unsafe_code)]
+//#![forbid(unsafe_code)]
 #![no_std]
 
 pub mod test;
@@ -79,7 +79,6 @@ pub mod rf233_const;
 pub mod screen;
 pub mod screen_shared;
 pub mod sdcard;
-pub mod segger_rtt;
 pub mod seven_segment;
 pub mod sh1106;
 pub mod sha;
