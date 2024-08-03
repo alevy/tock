@@ -4,6 +4,7 @@
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
+use core::sync::atomic::Ordering;
 use kernel::debug;
 use kernel::debug::IoWrite;
 use kernel::hil::led;
@@ -44,21 +45,21 @@ impl IoWrite for Writer {
             Writer::Uninitialized => {}
             Writer::WriterRtt(rtt_memory) => {
                 let up_buffer = unsafe { &*rtt_memory.get_up_buffer_ptr() };
-                let buffer_len = up_buffer.length.get();
+                let buffer_len = up_buffer.length;
                 let buffer = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        up_buffer.buffer.get() as *mut u8,
+                    core::slice::from_raw_parts(
+                        up_buffer.buffer,
                         buffer_len as usize,
                     )
                 };
 
-                let mut write_position = up_buffer.write_position.get();
+                let mut write_position = up_buffer.write_position.load(Ordering::SeqCst);
 
                 for &c in buf {
                     wait();
-                    buffer[write_position as usize] = c;
+                    buffer[write_position as usize].store(c, Ordering::SeqCst);
                     write_position = (write_position + 1) % buffer_len;
-                    up_buffer.write_position.set(write_position);
+                    up_buffer.write_position.store(write_position, Ordering::SeqCst);
                     wait();
                 }
             }

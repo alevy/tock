@@ -23,9 +23,9 @@
 
 use capsules_core::virtualizers::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicU8;
 use kernel::component::Component;
 use kernel::hil::time::{self, Alarm};
-use kernel::utilities::cells::VolatileCell;
 use segger::{SeggerRtt, SeggerRttMemory};
 
 // Setup static space for the objects.
@@ -34,10 +34,10 @@ macro_rules! segger_rtt_memory_component_static {
     () => {{
         let rtt_memory = kernel::static_named_buf!(segger::SeggerRttMemory, "_SEGGER_RTT");
         let up_buffer = kernel::static_buf!(
-            [kernel::utilities::cells::VolatileCell<u8>; segger::DEFAULT_UP_BUFFER_LENGTH]
+            [core::sync::atomic::AtomicU8; segger::DEFAULT_UP_BUFFER_LENGTH]
         );
         let down_buffer = kernel::static_buf!(
-            [kernel::utilities::cells::VolatileCell<u8>; segger::DEFAULT_DOWN_BUFFER_LENGTH]
+            [core::sync::atomic::AtomicU8; segger::DEFAULT_DOWN_BUFFER_LENGTH]
         );
 
         (rtt_memory, up_buffer, down_buffer)
@@ -82,8 +82,8 @@ impl SeggerRttMemoryComponent {
 impl Component for SeggerRttMemoryComponent {
     type StaticInput = (
         &'static mut MaybeUninit<SeggerRttMemory<'static>>,
-        &'static mut MaybeUninit<[VolatileCell<u8>; segger::DEFAULT_UP_BUFFER_LENGTH]>,
-        &'static mut MaybeUninit<[VolatileCell<u8>; segger::DEFAULT_DOWN_BUFFER_LENGTH]>,
+        &'static mut MaybeUninit<[AtomicU8; segger::DEFAULT_UP_BUFFER_LENGTH]>,
+        &'static mut MaybeUninit<[AtomicU8; segger::DEFAULT_DOWN_BUFFER_LENGTH]>,
     );
     type Output = SeggerRttMemoryRefs<'static>;
 
@@ -92,9 +92,9 @@ impl Component for SeggerRttMemoryComponent {
         let up_buffer_name = name;
         let down_buffer_name = name;
         let up_buffer =
-            s.1.write([const { VolatileCell::new(0) }; segger::DEFAULT_UP_BUFFER_LENGTH]);
+            s.1.write([const { AtomicU8::new(0) }; segger::DEFAULT_UP_BUFFER_LENGTH]);
         let down_buffer =
-            s.2.write([const { VolatileCell::new(0) }; segger::DEFAULT_DOWN_BUFFER_LENGTH]);
+            s.2.write([const { AtomicU8::new(0) }; segger::DEFAULT_DOWN_BUFFER_LENGTH]);
 
         let rtt_memory = s.0.write(SeggerRttMemory::new_raw(
             up_buffer_name,
