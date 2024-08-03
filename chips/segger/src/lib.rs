@@ -94,11 +94,11 @@
 
 use core::cell::Cell;
 use core::marker::PhantomData;
-use core::ops::Index;
+use core::ptr::{read_volatile, write_volatile};
 use kernel::hil;
 use kernel::hil::time::ConvertTicks;
 use kernel::hil::uart;
-use kernel::utilities::cells::{OptionalCell, TakeCell, VolatileCell};
+use kernel::utilities::cells::{OptionalCell, TakeCell};
 use kernel::ErrorCode;
 
 /// Suggested length for the up buffer to pass to the Segger RTT capsule.
@@ -112,44 +112,31 @@ pub const DEFAULT_DOWN_BUFFER_LENGTH: usize = 32;
 /// chip's memory and read and write messages to the appropriate buffers.
 #[repr(C)]
 pub struct SeggerRttMemory<'a> {
-    id: VolatileCell<[u8; 16]>,
-    number_up_buffers: VolatileCell<u32>,
-    number_down_buffers: VolatileCell<u32>,
+    id: [u8; 16],
+    number_up_buffers: u32,
+    number_down_buffers: u32,
     up_buffer: SeggerRttBuffer<'a>,
     down_buffer: SeggerRttBuffer<'a>,
 }
 
 #[repr(C)]
 pub struct SeggerRttBuffer<'a> {
-    name: VolatileCell<*const u8>, // Pointer to the name of this channel. Must be a 4 byte thin pointer.
+    name: *const u8, // Pointer to the name of this channel. Must be a 4 byte thin pointer.
     // These fields are marked as `pub` to allow access in the panic handler.
-    pub buffer: VolatileCell<*const VolatileCell<u8>>, // Pointer to the buffer for this channel.
-    pub length: VolatileCell<u32>,
-    pub write_position: VolatileCell<u32>,
-    read_position: VolatileCell<u32>,
-    flags: VolatileCell<u32>,
+    pub buffer: *mut u8, // Pointer to the buffer for this channel.
+    pub length: u32,
+    pub write_position: u32,
+    read_position: u32,
+    flags: u32,
     _lifetime: PhantomData<&'a ()>,
-}
-
-impl<'a> Index<usize> for SeggerRttBuffer<'a> {
-    type Output = VolatileCell<u8>;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        let index = index as isize;
-        if index >= self.length.get() as isize {
-            panic!("Index out of bounds {}/{}", index, self.length.get())
-        } else {
-            unsafe { &*self.buffer.get().offset(index) }
-        }
-    }
 }
 
 impl<'a> SeggerRttMemory<'a> {
     pub fn new_raw(
         up_buffer_name: &'a [u8],
-        up_buffer: &'a [VolatileCell<u8>],
+        up_buffer: &'a mut [u8],
         down_buffer_name: &'a [u8],
-        down_buffer: &'a [VolatileCell<u8>],
+        down_buffer: &'a mut [u8],
     ) -> SeggerRttMemory<'a> {
         SeggerRttMemory {
             // This field is a magic value that must be set to "SEGGER RTT" for the debugger to
@@ -159,25 +146,25 @@ impl<'a> SeggerRttMemory<'a> {
             // memory, therefore confusing the debugger. However in practice this hasn't caused any
             // known problem so far. If needed, this ID could be scrambled here, with the real magic
             // value being written only when this object is fully initialized.
-            id: VolatileCell::new(*b"SEGGER RTT\0\0\0\0\0\0"),
-            number_up_buffers: VolatileCell::new(1),
-            number_down_buffers: VolatileCell::new(1),
+            id: *b"SEGGER RTT\0\0\0\0\0\0",
+            number_up_buffers: 1,
+            number_down_buffers: 1,
             up_buffer: SeggerRttBuffer {
-                name: VolatileCell::new(up_buffer_name.as_ptr()),
-                buffer: VolatileCell::new(up_buffer.as_ptr()),
-                length: VolatileCell::new(up_buffer.len() as u32),
-                write_position: VolatileCell::new(0),
-                read_position: VolatileCell::new(0),
-                flags: VolatileCell::new(0),
+                name: up_buffer_name.as_ptr(),
+                buffer: up_buffer.as_mut_ptr(),
+                length: up_buffer.len() as u32,
+                write_position: 0,
+                read_position: 0,
+                flags: 0,
                 _lifetime: PhantomData,
             },
             down_buffer: SeggerRttBuffer {
-                name: VolatileCell::new(down_buffer_name.as_ptr()),
-                buffer: VolatileCell::new(down_buffer.as_ptr()),
-                length: VolatileCell::new(down_buffer.len() as u32),
-                write_position: VolatileCell::new(0),
-                read_position: VolatileCell::new(0),
-                flags: VolatileCell::new(0),
+                name: down_buffer_name.as_ptr(),
+                buffer: down_buffer.as_mut_ptr(),
+                length: down_buffer.len() as u32,
+                write_position: 0,
+                read_position: 0,
+                flags: 0,
                 _lifetime: PhantomData,
             },
         }
@@ -186,8 +173,8 @@ impl<'a> SeggerRttMemory<'a> {
     /// This getter allows access to the underlying buffer in the panic handler.
     /// The result is a pointer so that only `unsafe` code can actually dereference it - this is to
     /// restrict this priviledged access to the panic handler.
-    pub fn get_up_buffer_ptr(&self) -> *const SeggerRttBuffer<'a> {
-        &self.up_buffer
+    pub fn get_up_buffer_ptr(&self) -> *mut SeggerRttBuffer<'a> {
+        &self.up_buffer as *const _ as *mut _
     }
 }
 
@@ -226,15 +213,21 @@ impl<'a, A: hil::time::Alarm<'a>> uart::Transmit<'a> for SeggerRtt<'a, A> {
                 // Copy the incoming data into the buffer. Once we increment
                 // the `write_position` the RTT listener will go ahead and read
                 // the message from us.
-                let mut index = config.up_buffer.write_position.get() as usize;
-                let buffer_len = config.up_buffer.length.get() as usize;
+                let mut index = unsafe {
+		    read_volatile(&config.up_buffer.write_position) as usize
+		};
+                let buffer_len = config.up_buffer.length as usize;
 
                 for i in 0..tx_len {
-                    config.up_buffer[(i + index) % buffer_len].set(tx_data[i]);
+		    unsafe {
+			write_volatile(config.up_buffer.buffer.offset(((i + index) % buffer_len) as isize), tx_data[i]);
+		    }
                 }
 
                 index = (index + tx_len) % buffer_len;
-                config.up_buffer.write_position.set(index as u32);
+		unsafe {
+		    write_volatile(&mut config.up_buffer.write_position, index as u32);
+		}
                 self.tx_len.set(tx_len);
                 // Save the client buffer so we can pass it back with the callback.
                 self.client_buffer.replace(tx_data);
