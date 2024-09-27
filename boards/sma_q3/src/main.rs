@@ -11,12 +11,16 @@
 //! <https://hackaday.io/project/175577-hackable-nrf52840-smart-watch>
 
 #![no_std]
+#![feature(as_array_of_cells)]
 // Disable this attribute when documenting, as a workaround for
 // https://github.com/rust-lang/rust/issues/62184.
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
+use core::cell::Cell;
+use core::num::ParseIntError;
 use core::ptr::{addr_of, addr_of_mut};
+use core::str::FromStr;
 
 use capsules_core::virtualizers::virtual_aes_ccm::MuxAES128CCM;
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
@@ -545,6 +549,146 @@ pub unsafe fn start() -> (
     let _ = platform.pconsole.start();
     debug!("Initialization complete. Entering main loop\r");
     debug!("{}", &*addr_of!(nrf52840::ficr::FICR_INSTANCE));
+
+    {
+	use kernel::hil::gpio::{Configure as _, Output as _};
+	use kernel::hil::uart::{self, Receive as _, Configure as _};
+
+	let gps_uart = &base_peripherals.uarte0;
+
+	let gps_power = &nrf52840_peripherals.gpio_port[Pin::P0_29];
+
+	gps_uart.initialize(
+            nrf52840::pinmux::Pinmux::new(Pin::P0_31 as u32),
+            nrf52840::pinmux::Pinmux::new(Pin::P0_30 as u32),
+            None,
+            None,
+        );
+
+	gps_uart.configure(uart::Parameters {
+            baud_rate: 9600,
+            width: uart::Width::Eight,
+            parity: uart::Parity::None,
+            stop_bits: uart::StopBits::One,
+            hw_flow_control: false,
+        }).unwrap();
+
+	struct GPSClient(&'static dyn uart::Receive<'static>, Cell<[u8; 72]>, Cell<usize>);
+
+	#[derive(Debug)]
+	struct Timestamp {
+	    hour: u8,
+	    minute: u8,
+	    milliseconds: u16,
+	}
+
+	impl FromStr for Timestamp {
+	    type Err = ();
+
+	    fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let hour = s.get(0..2).unwrap_or("").parse().map_err(|_| ())?;
+		let minute = s.get(2..4).unwrap_or("").parse().map_err(|_| ())?;
+		let milliseconds: f32 = s.get(4..).unwrap_or("").parse().map_err(|_| ())?;
+		let milliseconds = (milliseconds * 1000.0) as u16;
+		Ok(Timestamp {
+		    hour,
+		    minute,
+		    milliseconds,
+		})
+	    }
+	}
+
+	#[derive(Debug)]
+	struct Date {
+	    day: u8,
+	    month: u8,
+	    year: u8,
+	}
+
+	impl FromStr for Date {
+	    type Err = ();
+
+	    fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let day = s.get(0..2).unwrap_or("").parse().map_err(|_| ())?;
+		let month = s.get(2..4).unwrap_or("").parse().map_err(|_| ())?;
+		let year = s.get(4..6).unwrap_or("").parse().map_err(|_| ())?;
+		Ok(Date {
+		    day,
+		    month,
+		    year,
+		})
+	    }
+	}
+
+	impl GPSClient {
+	    fn parse_line(line: &[u8]) -> Option<(Timestamp, Date)> {
+		let mut components = core::str::from_utf8(line).ok()?.split(',');
+
+		let cmd = components.next()?;
+		if let (_, "RMC") = cmd.split_at_checked(2)? {
+		    let utc = components.next()?;
+		    let status = components.next()?;
+		    let lat_degrees = components.next()?;
+		    let lat_ns = components.next()?;
+		    let lon_degrees = components.next()?;
+		    let lon_ew = components.next()?;
+		    let sog = components.next()?;
+		    let cog = components.next()?;
+		    let date = components.next()?;
+		    let magnetic_var = components.next()?;
+		    let magnetic_var_ew = components.next()?;
+		    let mode = components.next()?;
+		    let cs = components.next()?;
+		    utc.parse().ok().zip(date.parse().ok())
+		} else {
+		    None
+		}
+	    }
+	}
+
+	impl uart::ReceiveClient for GPSClient {
+	    fn received_buffer(
+		&self,
+		rx_buffer: &'static mut [u8],
+		_rx_len: usize,
+		_rval: Result<(), kernel::ErrorCode>,
+		_error: uart::Error,
+	    ) {
+		match rx_buffer[0] {
+		    b'\n' | b'\r' => {
+			if self.2.get() > 0 {
+			    if let Some((t, d)) = GPSClient::parse_line(&self.1.get()[..self.2.get()]) {
+				debug!("{:?} {:?}", t, d);
+			    }
+
+			    //debug!("Hello {:?}", core::str::from_utf8(&self.1.get()[..self.2.get()]).unwrap().split(',').next());
+			}
+			self.2.set(0);
+		    },
+		    b'$' | b'!' => {
+			self.2.set(0);
+		    },
+		    c => {
+			self.1.as_array_of_cells()[self.2.get()].set(c);
+			self.2.set(self.2.get() + 1);
+		    }
+		}
+		self.0.receive_buffer(rx_buffer, rx_buffer.len()).unwrap();
+	    }
+	}
+
+	let gps_client = static_init!(GPSClient, GPSClient(gps_uart, Cell::new([0; 72]), Cell::new(0)));
+
+	gps_uart.set_receive_client(gps_client);
+
+	static mut BUFFER: [u8; 1] = [0; 1];
+	gps_uart.receive_buffer(&mut BUFFER, BUFFER.len()).unwrap();
+
+	gps_power.make_output();
+	gps_power.set();
+	debug!("Starting recv");
+
+    }
 
     load_processes(board_kernel, chip);
     // These symbols are defined in the linker script.
