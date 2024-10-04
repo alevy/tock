@@ -17,10 +17,7 @@
 #![cfg_attr(not(doc), no_main)]
 #![deny(missing_docs)]
 
-use core::cell::Cell;
-use core::num::ParseIntError;
 use core::ptr::{addr_of, addr_of_mut};
-use core::str::FromStr;
 
 use capsules_core::virtualizers::virtual_aes_ccm::MuxAES128CCM;
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
@@ -32,6 +29,9 @@ use kernel::hil::led::LedHigh;
 use kernel::hil::screen::Screen;
 use kernel::hil::symmetric_encryption::AES128;
 use kernel::hil::time::Counter;
+use kernel::hil::gpio::{Configure as _, Output as _};
+use kernel::hil::uart::{self, Receive as _, Configure as _};
+
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::scheduler::round_robin::RoundRobinSched;
 #[allow(unused_imports)]
@@ -60,6 +60,9 @@ const DEFAULT_EXT_SRC_MAC: [u8; 8] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 
 
 /// UART Writer
 pub mod io;
+
+/// NMEA
+pub mod nmea0183;
 
 // State for loading and holding applications.
 // How should the kernel respond when a process faults.
@@ -105,12 +108,6 @@ pub struct Platform {
     >,
     ieee802154_radio: &'static Ieee802154Driver,
     button: &'static capsules_core::button::Button<'static, nrf52840::gpio::GPIOPin<'static>>,
-    pconsole: &'static capsules_core::process_console::ProcessConsole<
-        'static,
-        { capsules_core::process_console::DEFAULT_COMMAND_HISTORY_LEN },
-        VirtualMuxAlarm<'static, nrf52840::rtc::Rtc<'static>>,
-        components::process_console::Capability,
-    >,
     console: &'static capsules_core::console::Console<'static>,
     gpio: &'static capsules_core::gpio::GPIO<'static, nrf52840::gpio::GPIOPin<'static>>,
     led: &'static capsules_core::led::LedDriver<
@@ -120,10 +117,7 @@ pub struct Platform {
     >,
     rng: &'static RngDriver,
     ipc: kernel::ipc::IPC<{ NUM_PROCS as u8 }>,
-    analog_comparator: &'static capsules_extra::analog_comparator::AnalogComparator<
-        'static,
-        nrf52840::acomp::Comparator<'static>,
-    >,
+    adc: &'static capsules_core::adc::AdcDedicated<'static, nrf52840::adc::Adc<'static>>,
     alarm: &'static capsules_core::alarm::AlarmDriver<
         'static,
         capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm<
@@ -134,6 +128,7 @@ pub struct Platform {
     screen: &'static capsules_extra::screen::Screen<'static>,
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm4::systick::SysTick,
+    date_time: &'static capsules_extra::date_time::DateTimeCapsule<'static, nmea0183::GNSS<'static, nrf52840::uart::Uarte<'static>, nrf52840::gpio::GPIOPin<'static>>>,
 }
 
 impl SyscallDriverLookup for Platform {
@@ -151,8 +146,9 @@ impl SyscallDriverLookup for Platform {
             capsules_extra::ble_advertising_driver::DRIVER_NUM => f(Some(self.ble_radio)),
             capsules_extra::ieee802154::DRIVER_NUM => f(Some(self.ieee802154_radio)),
             capsules_extra::temperature::DRIVER_NUM => f(Some(self.temperature)),
-            capsules_extra::analog_comparator::DRIVER_NUM => f(Some(self.analog_comparator)),
             capsules_extra::screen::DRIVER_NUM => f(Some(self.screen)),
+            capsules_extra::date_time::DRIVER_NUM => f(Some(self.date_time)),
+            capsules_core::adc::DRIVER_NUM => f(Some(self.adc)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
@@ -314,17 +310,6 @@ pub unsafe fn start() -> (
     let uart_mux = components::console::UartMuxComponent::new(uart_channel, 115200)
         .finalize(components::uart_mux_component_static!());
 
-    let pconsole = components::process_console::ProcessConsoleComponent::new(
-        board_kernel,
-        uart_mux,
-        mux_alarm,
-        process_printer,
-        Some(cortexm4::support::reset),
-    )
-    .finalize(components::process_console_component_static!(
-        nrf52840::rtc::Rtc<'static>
-    ));
-
     // Setup the console.
     let console = components::console::ConsoleComponent::new(
         board_kernel,
@@ -368,17 +353,6 @@ pub unsafe fn start() -> (
         nrf52840::aes::AesECB<'static>
     ));
 
-    // Not exposed in favor of the BMP280, but present.
-    // Possibly needs power management all the same.
-    let _temp = components::temperature::TemperatureComponent::new(
-        board_kernel,
-        capsules_extra::temperature::DRIVER_NUM,
-        &base_peripherals.temp,
-    )
-    .finalize(components::temperature_component_static!(
-        nrf52840::temperature::Temp
-    ));
-
     let sensors_i2c_bus = static_init!(
         capsules_core::virtualizers::virtual_i2c::MuxI2C<'static, nrf52840::i2c::TWI>,
         capsules_core::virtualizers::virtual_i2c::MuxI2C::new(&base_peripherals.twi1, None,)
@@ -415,20 +389,26 @@ pub unsafe fn start() -> (
     )
     .finalize(components::rng_component_static!(nrf52840::trng::Trng));
 
-    // Initialize AC using AIN5 (P0.29) as VIN+ and VIN- as AIN0 (P0.02)
-    // These are hardcoded pin assignments specified in the driver
-    let analog_comparator = components::analog_comparator::AnalogComparatorComponent::new(
-        &base_peripherals.acomp,
-        components::analog_comparator_component_helper!(
-            nrf52840::acomp::Channel,
-            &*addr_of!(nrf52840::acomp::CHANNEL_AC0)
-        ),
+    //--------------------------------------------------------------------------
+    // ADC
+    //--------------------------------------------------------------------------
+
+    let adc_channels = static_init!(
+        [nrf52840::adc::AdcChannelSetup; 1],
+        [
+            nrf52840::adc::AdcChannelSetup::new(nrf52840::adc::AdcChannel::AnalogInput1),
+        ]
+    );
+    let adc = components::adc::AdcDedicatedComponent::new(
+        &base_peripherals.adc,
+        adc_channels,
         board_kernel,
-        capsules_extra::analog_comparator::DRIVER_NUM,
+        capsules_core::adc::DRIVER_NUM,
     )
-    .finalize(components::analog_comparator_component_static!(
-        nrf52840::acomp::Comparator
+    .finalize(components::adc_dedicated_component_static!(
+        nrf52840::adc::Adc
     ));
+
 
     nrf52_components::NrfClockComponent::new(&base_peripherals.clock).finalize(());
 
@@ -485,18 +465,47 @@ pub unsafe fn start() -> (
         screen
     };
 
+    let gps_uart = &base_peripherals.uarte0;
+
+    let gps_power = &nrf52840_peripherals.gpio_port[Pin::P0_29];
+    gps_power.make_output();
+    gps_power.clear();
+
+    gps_uart.initialize(
+	nrf52840::pinmux::Pinmux::new(Pin::P0_31 as u32),
+	nrf52840::pinmux::Pinmux::new(Pin::P0_30 as u32),
+	None,
+	None,
+    );
+
+    gps_uart.configure(uart::Parameters {
+	baud_rate: 9600,
+	width: uart::Width::Eight,
+	parity: uart::Parity::None,
+	stop_bits: uart::StopBits::One,
+	hw_flow_control: false,
+    }).unwrap();
+
+    let gnss = static_init!(nmea0183::GNSS<'static, nrf52840::uart::Uarte<'static>, nrf52840::gpio::GPIOPin<'static>>, nmea0183::GNSS::new(gps_uart, gps_power, static_init!([u8; 1], [0])));
+    gps_uart.set_receive_client(gnss);
+
+    let date_time = components::date_time::DateTimeComponent::new(board_kernel, capsules_extra::date_time::DRIVER_NUM, gnss)
+    .finalize(components::date_time_component_static!(
+        nmea0183::GNSS<'static, nrf52840::uart::Uarte<'static>, nrf52840::gpio::GPIOPin<'static>>
+    ));
+
     let platform = Platform {
+	date_time,
+	adc,
         temperature,
         button,
         ble_radio,
         ieee802154_radio,
-        pconsole,
         console,
         led,
         gpio,
         rng,
         alarm,
-        analog_comparator,
         screen,
         ipc: kernel::ipc::IPC::new(
             board_kernel,
@@ -546,149 +555,10 @@ pub unsafe fn start() -> (
         }
     }
 
-    let _ = platform.pconsole.start();
+    base_peripherals.adc.calibrate();
+
     debug!("Initialization complete. Entering main loop\r");
     debug!("{}", &*addr_of!(nrf52840::ficr::FICR_INSTANCE));
-
-    {
-	use kernel::hil::gpio::{Configure as _, Output as _};
-	use kernel::hil::uart::{self, Receive as _, Configure as _};
-
-	let gps_uart = &base_peripherals.uarte0;
-
-	let gps_power = &nrf52840_peripherals.gpio_port[Pin::P0_29];
-
-	gps_uart.initialize(
-            nrf52840::pinmux::Pinmux::new(Pin::P0_31 as u32),
-            nrf52840::pinmux::Pinmux::new(Pin::P0_30 as u32),
-            None,
-            None,
-        );
-
-	gps_uart.configure(uart::Parameters {
-            baud_rate: 9600,
-            width: uart::Width::Eight,
-            parity: uart::Parity::None,
-            stop_bits: uart::StopBits::One,
-            hw_flow_control: false,
-        }).unwrap();
-
-	struct GPSClient(&'static dyn uart::Receive<'static>, Cell<[u8; 72]>, Cell<usize>);
-
-	#[derive(Debug)]
-	struct Timestamp {
-	    hour: u8,
-	    minute: u8,
-	    milliseconds: u16,
-	}
-
-	impl FromStr for Timestamp {
-	    type Err = ();
-
-	    fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let hour = s.get(0..2).unwrap_or("").parse().map_err(|_| ())?;
-		let minute = s.get(2..4).unwrap_or("").parse().map_err(|_| ())?;
-		let milliseconds: f32 = s.get(4..).unwrap_or("").parse().map_err(|_| ())?;
-		let milliseconds = (milliseconds * 1000.0) as u16;
-		Ok(Timestamp {
-		    hour,
-		    minute,
-		    milliseconds,
-		})
-	    }
-	}
-
-	#[derive(Debug)]
-	struct Date {
-	    day: u8,
-	    month: u8,
-	    year: u8,
-	}
-
-	impl FromStr for Date {
-	    type Err = ();
-
-	    fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let day = s.get(0..2).unwrap_or("").parse().map_err(|_| ())?;
-		let month = s.get(2..4).unwrap_or("").parse().map_err(|_| ())?;
-		let year = s.get(4..6).unwrap_or("").parse().map_err(|_| ())?;
-		Ok(Date {
-		    day,
-		    month,
-		    year,
-		})
-	    }
-	}
-
-	impl GPSClient {
-	    fn parse_line(line: &[u8]) -> Option<(Timestamp, Date)> {
-		let mut components = core::str::from_utf8(line).ok()?.split(',');
-
-		let cmd = components.next()?;
-		if let (_, "RMC") = cmd.split_at_checked(2)? {
-		    let utc = components.next()?;
-		    let status = components.next()?;
-		    let lat_degrees = components.next()?;
-		    let lat_ns = components.next()?;
-		    let lon_degrees = components.next()?;
-		    let lon_ew = components.next()?;
-		    let sog = components.next()?;
-		    let cog = components.next()?;
-		    let date = components.next()?;
-		    let magnetic_var = components.next()?;
-		    let magnetic_var_ew = components.next()?;
-		    let mode = components.next()?;
-		    let cs = components.next()?;
-		    utc.parse().ok().zip(date.parse().ok())
-		} else {
-		    None
-		}
-	    }
-	}
-
-	impl uart::ReceiveClient for GPSClient {
-	    fn received_buffer(
-		&self,
-		rx_buffer: &'static mut [u8],
-		_rx_len: usize,
-		_rval: Result<(), kernel::ErrorCode>,
-		_error: uart::Error,
-	    ) {
-		match rx_buffer[0] {
-		    b'\n' | b'\r' => {
-			if self.2.get() > 0 {
-			    if let Some((t, d)) = GPSClient::parse_line(&self.1.get()[..self.2.get()]) {
-				debug!("{:?} {:?}", t, d);
-			    }
-
-			    //debug!("Hello {:?}", core::str::from_utf8(&self.1.get()[..self.2.get()]).unwrap().split(',').next());
-			}
-			self.2.set(0);
-		    },
-		    b'$' | b'!' => {
-			self.2.set(0);
-		    },
-		    c => {
-			self.1.as_array_of_cells()[self.2.get()].set(c);
-			self.2.set(self.2.get() + 1);
-		    }
-		}
-		self.0.receive_buffer(rx_buffer, rx_buffer.len()).unwrap();
-	    }
-	}
-
-	let gps_client = static_init!(GPSClient, GPSClient(gps_uart, Cell::new([0; 72]), Cell::new(0)));
-
-	gps_uart.set_receive_client(gps_client);
-
-	static mut BUFFER: [u8; 1] = [0; 1];
-	gps_uart.receive_buffer(&mut BUFFER, BUFFER.len()).unwrap();
-
-	gps_power.make_output();
-	gps_power.set();
-	debug!("Starting recv");
-
-    }
 
     load_processes(board_kernel, chip);
     // These symbols are defined in the linker script.

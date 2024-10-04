@@ -55,7 +55,7 @@ impl<D: 'static + date_time::DateTime<'static>> DateTimeComponent<D> {
     }
 }
 
-impl<D: 'static + date_time::DateTime<'static> + kernel::deferred_call::DeferredCallClient>
+impl<D: 'static + date_time::DateTime<'static>>
     Component for DateTimeComponent<D>
 {
     type StaticInput = &'static mut MaybeUninit<DateTimeCapsule<'static, D>>;
