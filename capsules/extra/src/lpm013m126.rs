@@ -742,6 +742,7 @@ where
             }
             _ => {
                 self.extcomin.toggle();
+                self.arm_alarm();
             }
         };
     }
