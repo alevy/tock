@@ -594,8 +594,8 @@ pub unsafe fn start() -> (
                 RPGpio::GPIO23 as u32,
                 RPGpioPin::new(RPGpio::GPIO25),
                 rp2040::pio::SMNumber::SM0,
-                include_bytes!("../../cyw43-firmware/43439A0_clm.bin"),
-                include_bytes!("../../cyw43-firmware/43439A0.bin")
+                include_bytes!("../../../firmware/cyw43439/43439A0_clm.bin"),
+                include_bytes!("../../../firmware/cyw43439/43439A0.bin")
             )
         );
 
