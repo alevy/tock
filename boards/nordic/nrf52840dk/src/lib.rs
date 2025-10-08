@@ -138,6 +138,7 @@ const USB_DEBUGGING: bool = false;
 
 /// This platform's chip type:
 pub type Chip = nrf52840::chip::NRF52<'static, Nrf52840DefaultPeripherals<'static>>;
+type ThreadIdProvider = <Chip as kernel::platform::chip::Chip>::ThreadIdProvider;
 /// Type for the process details printer.
 type ProcessPrinter = capsules_system::process_printer::ProcessPrinterText;
 
@@ -413,8 +414,8 @@ pub unsafe fn start_no_pconsole() -> (
     nrf52840::init();
 
     // Bind global variables to this thread.
-    PANIC_RESOURCES.bind_to_thread::<<Chip as kernel::platform::chip::Chip>::ThreadIdProvider>();
-    RTT_BUFFER.bind_to_thread::<<Chip as kernel::platform::chip::Chip>::ThreadIdProvider>();
+    PANIC_RESOURCES.bind_to_thread::<ThreadIdProvider>();
+    RTT_BUFFER.bind_to_thread::<ThreadIdProvider>();
 
     // Set up peripheral drivers. Called in separate function to reduce stack
     // usage.
@@ -433,7 +434,7 @@ pub unsafe fn start_no_pconsole() -> (
     let base_peripherals = &nrf52840_peripherals.nrf52;
 
     // Configure kernel debug GPIOs as early as possible.
-    kernel::debug::assign_gpios(
+    kernel::debug::assign_gpios::<ThreadIdProvider>(
         Some(&nrf52840_peripherals.gpio_port[LED1_PIN]),
         Some(&nrf52840_peripherals.gpio_port[LED2_PIN]),
         Some(&nrf52840_peripherals.gpio_port[LED3_PIN]),
@@ -638,7 +639,7 @@ pub unsafe fn start_no_pconsole() -> (
     .finalize(components::console_component_static!());
 
     // Create the debugger object that handles calls to `debug!()`.
-    components::debug_writer::DebugWriterComponent::new(
+    components::debug_writer::DebugWriterComponent::<ThreadIdProvider, _, _>::new(
         uart_mux,
         create_capability!(capabilities::SetDebugWriterCapability),
     )

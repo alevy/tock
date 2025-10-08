@@ -27,6 +27,7 @@ pub mod io;
 pub const NUM_PROCS: usize = 4;
 
 pub type Chip = QemuRv32VirtChip<'static, QemuRv32VirtDefaultPeripherals<'static>>;
+type ThreadIdProvider = <Chip as kernel::platform::chip::Chip>::ThreadIdProvider;
 type ProcessPrinter = capsules_system::process_printer::ProcessPrinterText;
 
 type RngDriver = components::rng::RngRandomComponentType<
@@ -188,7 +189,7 @@ pub unsafe fn start() -> (
     }
     // ---------- BASIC INITIALIZATION -----------
 
-    PANIC_RESOURCES.bind_to_thread::<<Chip as kernel::platform::chip::Chip>::ThreadIdProvider>();
+    PANIC_RESOURCES.bind_to_thread::<ThreadIdProvider>();
 
     // Basic setup of the RISC-V IMAC platform
     rv32i::configure_trap_handler();
@@ -669,7 +670,7 @@ pub unsafe fn start() -> (
     )
     .finalize(components::console_component_static!());
     // Create the debugger object that handles calls to `debug!()`.
-    components::debug_writer::DebugWriterComponent::new(
+    components::debug_writer::DebugWriterComponent::<ThreadIdProvider, _, _>::new(
         uart_mux,
         create_capability!(capabilities::SetDebugWriterCapability),
     )
