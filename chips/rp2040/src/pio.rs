@@ -954,6 +954,24 @@ impl StateMachine {
             .modify(SMx_INSTR::INSTR.val(0));
     }
 
+    /// Address of the RX FIFO
+    pub fn rxf_addr(&self, pio: PIONumber) -> u32 {
+        let base_addr = match pio {
+            PIONumber::PIO0 => PIO_0_BASE_ADDRESS,
+            PIONumber::PIO1 => PIO_1_BASE_ADDRESS,
+        };
+        (base_addr as u32) + 0x20 + 4 * (self.sm_number as u32)
+    }
+
+    /// Address of the TX FIFO
+    pub fn txf_addr(&self, pio: PIONumber) -> u32 {
+        let base_addr = match pio {
+            PIONumber::PIO0 => PIO_0_BASE_ADDRESS,
+            PIONumber::PIO1 => PIO_1_BASE_ADDRESS,
+        };
+        (base_addr as u32) + 0x10 + 4 * (self.sm_number as u32)
+    }
+
     /// Restart a state machine.
     pub fn restart(&self) {
         match self.sm_number {
@@ -1346,6 +1364,11 @@ impl Pio {
             sms: SM_NUMBERS.map(|x| StateMachine::new(x, PIO1_BASE, PIO1_XOR_BASE, PIO1_SET_BASE)),
             instructions_used: Cell::new(0),
         }
+    }
+
+    /// Get the PIO number
+    pub fn number(&self) -> PIONumber {
+        self.pio_number
     }
 
     /// Get state machine
@@ -1847,11 +1870,11 @@ mod examples {
             dio_pin_handle.set_floating_state(kernel::hil::gpio::FloatingState::PullNone);
             dio_pin_handle.set_schmitt(true);
             self.set_input_sync_bypass(&dio_pin_handle, true);
-            dio_pin_handle.set_drive_strength(crate::gpio::DriveStrength::_12mA);
+            dio_pin_handle.set_drive_strength(crate::gpio::DriveStrength::Drive12ma);
             dio_pin_handle.set_slew_rate(crate::gpio::SlewRate::Fast);
             dio_pin_handle.activate_pads();
 
-            clock_pin_handle.set_drive_strength(crate::gpio::DriveStrength::_12mA);
+            clock_pin_handle.set_drive_strength(crate::gpio::DriveStrength::Drive12ma);
             clock_pin_handle.set_slew_rate(crate::gpio::SlewRate::Fast);
             clock_pin_handle.set_floating_state(kernel::hil::gpio::FloatingState::PullNone);
             clock_pin_handle.set_schmitt(true);

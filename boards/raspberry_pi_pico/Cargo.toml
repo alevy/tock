@@ -19,6 +19,7 @@ enum_primitive = { path = "../../libraries/enum_primitive" }
 capsules-core = { path = "../../capsules/core" }
 capsules-extra = { path = "../../capsules/extra" }
 capsules-system = { path = "../../capsules/system" }
+cyw4343 = { path = "../../capsules/cyw4343" }
 
 [build-dependencies]
 tock_build_scripts = { path = "../build_scripts" }

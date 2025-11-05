@@ -219,10 +219,10 @@ register_bitfields![u32,
         OD OFFSET(7) NUMBITS(1) [],
         IE OFFSET(6) NUMBITS(1) [],
         DRIVE OFFSET(4) NUMBITS(2) [
-            _2mA = 0,
-            _4mA = 1,
-            _8mA = 2,
-            _12mA = 3,
+            Drive2mA = 0,
+            Drive4mA = 1,
+            Drive8mA = 2,
+            Drive12mA = 3,
         ],
         PUE OFFSET(3) NUMBITS(1) [],
         PDE OFFSET(2) NUMBITS(1) [],
@@ -408,10 +408,10 @@ pub enum SlewRate {
 /// Drive Strength of a GPIO Pin
 #[derive(Debug, Eq, PartialEq)]
 pub enum DriveStrength {
-    _2mA = 0,
-    _4mA = 1,
-    _8mA = 2,
-    _12mA = 3,
+    Drive2mA = 0,
+    Drive4ma = 1,
+    Drive8ma = 2,
+    Drive12ma = 3,
 }
 
 pub struct RPGpioPin<'a> {

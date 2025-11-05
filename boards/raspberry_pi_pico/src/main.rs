@@ -14,7 +14,6 @@ use core::ptr::addr_of_mut;
 
 use capsules_core::i2c_master::I2CMasterDriver;
 use capsules_core::virtualizers::virtual_alarm::VirtualMuxAlarm;
-use capsules_extra::ethernet_tap;
 use components::date_time_component_static;
 use components::gpio::GpioComponent;
 use components::led::LedsComponent;
@@ -24,7 +23,6 @@ use kernel::debug;
 use kernel::hil::gpio::{Configure, FloatingState};
 use kernel::hil::i2c::I2CMaster;
 use kernel::hil::led::LedHigh;
-use kernel::hil::time::Alarm;
 use kernel::hil::usb::Client;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::process::ProcessArray;
@@ -39,9 +37,9 @@ use rp2040::clocks::{
     ReferenceAuxiliaryClockSource, ReferenceClockSource, RtcAuxiliaryClockSource,
     SystemAuxiliaryClockSource, SystemClockSource, UsbAuxiliaryClockSource,
 };
-use rp2040::cyw43439::PioCyw43439;
 use rp2040::gpio::{GpioFunction, RPGpio, RPGpioPin};
 use rp2040::i2c::I2c;
+use rp2040::pio_gspi::PioGSpi;
 use rp2040::resets::Peripheral;
 use rp2040::sysinfo;
 use rp2040::timer::RPTimer;
@@ -83,6 +81,19 @@ type TemperatureRp2040Sensor = components::temperature_rp2040::TemperatureRp2040
 >;
 type TemperatureDriver = components::temperature::TemperatureComponentType<TemperatureRp2040Sensor>;
 
+type CYW4343xSpiBus = cyw4343::spi_bus::CYW4343xSpiBus<
+    'static,
+    PioGSpi<'static>,
+    VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
+>;
+
+type CYW4343xDriver = cyw4343::CYW4343x<
+    'static,
+    RPGpioPin<'static>,
+    VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
+    CYW4343xSpiBus,
+>;
+
 const WIFI: bool = option_env!("WIFI").is_some();
 
 /// Supported drivers by the platform
@@ -94,23 +105,16 @@ pub struct RaspberryPiPico {
         VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
     >,
     gpio: &'static capsules_core::gpio::GPIO<'static, RPGpioPin<'static>>,
-    led: &'static capsules_core::led::LedDriver<'static, LedHigh<'static, RPGpioPin<'static>>, 1>,
+    // The on-board LED is connected to the WiFi chip on PICO W boards
+    led: Option<
+        &'static capsules_core::led::LedDriver<'static, LedHigh<'static, RPGpioPin<'static>>, 1>,
+    >,
     adc: &'static capsules_core::adc::AdcVirtualized<'static>,
     temperature: &'static TemperatureDriver,
     i2c: &'static capsules_core::i2c_master::I2CMasterDriver<'static, I2c<'static, 'static>>,
-
-    ethernet: Option<
-        &'static capsules_extra::ethernet_tap::EthernetTapDriver<
-            'static,
-            rp2040::cyw43439::PioCyw43439<
-                'static,
-                VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
-            >,
-        >,
-    >,
-
     date_time:
         &'static capsules_extra::date_time::DateTimeCapsule<'static, rp2040::rtc::Rtc<'static>>,
+    wifi: Option<&'static capsules_extra::wifi::WifiDriver<'static, CYW4343xDriver>>,
     scheduler: &'static RoundRobinSched<'static>,
     systick: cortexm0p::systick::SysTick,
 }
@@ -124,19 +128,13 @@ impl SyscallDriverLookup for RaspberryPiPico {
             capsules_core::console::DRIVER_NUM => f(Some(self.console)),
             capsules_core::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules_core::gpio::DRIVER_NUM => f(Some(self.gpio)),
-            capsules_core::led::DRIVER_NUM => f(Some(self.led)),
+            capsules_core::led::DRIVER_NUM => f(self.led.map(|led| led as _)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             capsules_core::adc::DRIVER_NUM => f(Some(self.adc)),
             capsules_extra::temperature::DRIVER_NUM => f(Some(self.temperature)),
             capsules_core::i2c_master::DRIVER_NUM => f(Some(self.i2c)),
             capsules_extra::date_time::DRIVER_NUM => f(Some(self.date_time)),
-            capsules_extra::ethernet_tap::DRIVER_NUM => {
-                if let Some(ethernet) = self.ethernet {
-                    f(Some(ethernet))
-                } else {
-                    f(None)
-                }
-            }
+            capsules_extra::wifi::DRIVER_NUM => f(self.wifi.map(|wifi| wifi as _)),
             _ => f(None),
         }
     }
@@ -461,10 +459,12 @@ pub unsafe fn start() -> (
     )
     .finalize(components::gpio_component_static!(RPGpioPin<'static>));
 
-    let led = LedsComponent::new().finalize(components::led_component_static!(
-        LedHigh<'static, RPGpioPin<'static>>,
-        LedHigh::new(peripherals.pins.get_pin(RPGpio::GPIO25))
-    ));
+    let led = (!WIFI).then(|| {
+        LedsComponent::new().finalize(components::led_component_static!(
+            LedHigh<'static, RPGpioPin<'static>>,
+            LedHigh::new(peripherals.pins.get_pin(RPGpio::GPIO25))
+        ))
+    });
 
     peripherals.adc.init();
 
@@ -569,71 +569,48 @@ pub unsafe fn start() -> (
     i2c0.init(10 * 1000);
     i2c0.set_master_client(i2c);
 
-    let ethernet = if WIFI {
+    let wifi = WIFI.then(|| {
         let pio_pwr = peripherals.pins.get_pin(RPGpio::GPIO23);
         pio_pwr.make_output();
 
         let pio_cs = peripherals.pins.get_pin(RPGpio::GPIO25);
         pio_cs.make_output();
 
-        let packet_buffer = static_init!([u32; 513], [0u32; 513]);
+        peripherals.pins.get_pin(RPGpio::GPIO25).make_output();
 
-        let virtual_mux_alarm = static_init!(
-            VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>,
-            VirtualMuxAlarm::new(mux_alarm)
-        );
-        virtual_mux_alarm.setup();
+        let dma_channel = peripherals.dma.channel(rp2040::dma::Channel::Channel0);
+        dma_channel.enable_interrupt(rp2040::dma::Irq::Irq0);
 
         let pio_cyw = static_init!(
-            PioCyw43439<VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>>,
-            PioCyw43439::<VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>>::new(
+            PioGSpi<'static>,
+            PioGSpi::new(
                 &peripherals.pio0,
-                virtual_mux_alarm,
+                dma_channel,
                 RPGpio::GPIO29 as u32,
                 RPGpio::GPIO24 as u32,
-                RPGpio::GPIO23 as u32,
                 RPGpioPin::new(RPGpio::GPIO25),
                 rp2040::pio::SMNumber::SM0,
-                include_bytes!("../../../firmware/cyw43439/43439A0_clm.bin"),
-                include_bytes!("../../../firmware/cyw43439/43439A0.bin")
             )
         );
 
-        virtual_mux_alarm.set_alarm_client(pio_cyw);
+        dma_channel.set_client(pio_cyw);
 
-        peripherals
-            .pio0
-            .sm(pio_cyw.sm_number())
-            .set_sm_client(pio_cyw);
-
-        pio_cyw.set_buffer(packet_buffer);
+        let sm = peripherals.pio0.sm(pio_cyw.sm_number());
         pio_cyw.init();
-        kernel::deferred_call::DeferredCallClient::register(pio_cyw);
+        sm.set_sm_client(pio_cyw);
 
-        let ethernet_tap_tx_buffer = static_init!(
-            [u8; capsules_extra::ethernet_tap::MAX_MTU],
-            [0; capsules_extra::ethernet_tap::MAX_MTU],
+        let cyw4343::firmware::CYW4343xBlobs { fw, nvram, clm } = cyw4343::firmware::CYW43439_BLOBS;
+
+        let bus = cyw4343::CYW4343xSpiBusComponent::new(mux_alarm, pio_cyw, fw, nvram).finalize(
+            cyw4343::cyw4343x_spi_bus_component_static!(PioGSpi<'static>, RPTimer),
         );
-
-        let ethernet = static_init!(
-            ethernet_tap::EthernetTapDriver<
-                'static,
-                PioCyw43439<VirtualMuxAlarm<'static, rp2040::timer::RPTimer<'static>>>,
-            >,
-            ethernet_tap::EthernetTapDriver::new(
-                pio_cyw,
-                board_kernel.create_grant(ethernet_tap::DRIVER_NUM, &memory_allocation_capability),
-                ethernet_tap_tx_buffer
-            )
+        pio_cyw.set_irq_client(bus);
+        let device = cyw4343::CYW4343xComponent::new(pio_pwr, mux_alarm, bus, clm).finalize(
+            cyw4343::cyw4343_component_static!(RPGpioPin, RPTimer, CYW4343xSpiBus),
         );
-
-        use kernel::hil::ethernet::EthernetAdapterDatapath;
-        pio_cyw.set_client(ethernet);
-        ethernet.initialize();
-        Some(&*ethernet)
-    } else {
-        None
-    };
+        components::wifi::WifiComponent::new(board_kernel, capsules_extra::wifi::DRIVER_NUM, device)
+            .finalize(components::wifi_component_static!(CYW4343xDriver))
+    });
 
     let scheduler = components::sched::round_robin::RoundRobinComponent::new(processes)
         .finalize(components::round_robin_component_static!(NUM_PROCS));
@@ -652,7 +629,7 @@ pub unsafe fn start() -> (
         temperature: temp,
         i2c,
         date_time,
-        ethernet,
+        wifi,
 
         scheduler,
         systick: cortexm0p::systick::SysTick::new_with_calibration(125_000_000),

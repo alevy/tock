@@ -7,12 +7,13 @@
 pub mod adc;
 pub mod chip;
 pub mod clocks;
-pub mod cyw43439;
 mod deferred_calls;
+pub mod dma;
 pub mod gpio;
 pub mod i2c;
 pub mod interrupts;
 pub mod pio;
+pub mod pio_gspi;
 pub mod pio_pwm;
 pub mod pio_spi;
 pub mod pwm;
