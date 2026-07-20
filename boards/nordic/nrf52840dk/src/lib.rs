@@ -129,7 +129,6 @@ const DEFAULT_CTX_PREFIX: [u8; 16] = [0x0_u8; 16]; //Context for 6LoWPAN Compres
 /// Debug Writer
 pub mod io;
 
-mod ble_test_advertiser;
 
 /// Whether to use UART debugging or Segger RTT (USB) debugging.
 ///
@@ -685,30 +684,10 @@ pub unsafe fn start_no_pconsole() -> (
     kernel::hil::time::Alarm::set_alarm_client(conn_alarm, conn_manager);
     conn_manager.set_driver_client();
 
-    // BLE test advertiser: advertise on boot and accept the first CONNECT_IND.
-    // This overrides the userspace BLE advertising driver's TX/RX clients,
-    // making the device connectable without a userspace app.
-    let ble_adv_buf = static_init!([u8; 64], [0u8; 64]);
-    let ble_adv_alarm = static_init!(
-        VirtualMuxAlarm<'static, AlarmHw>,
-        VirtualMuxAlarm::new(mux_alarm)
-    );
-    ble_adv_alarm.setup();
-    let test_adv = static_init!(
-        ble_test_advertiser::BleTestAdvertiser<
-            'static,
-            BleHw,
-            VirtualMuxAlarm<'static, AlarmHw>,
-        >,
-        ble_test_advertiser::BleTestAdvertiser::new(
-            &base_peripherals.ble_radio,
-            ble_adv_alarm,
-            ble_adv_buf,
-        )
-    );
-    kernel::hil::time::Alarm::set_alarm_client(ble_adv_alarm, test_adv);
-    test_adv.set_connection_setup_client(conn_manager);
-    test_adv.start();
+    // Wire the connection manager into the BLE advertising driver and start
+    // connectable advertising on boot.  No userspace app is required.
+    ble_radio.set_connection_driver(&base_peripherals.ble_radio, conn_manager);
+    ble_radio.start_connectable_advertising();
 
     //--------------------------------------------------------------------------
     // TEMPERATURE (internal)
