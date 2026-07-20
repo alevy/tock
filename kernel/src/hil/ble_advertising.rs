@@ -72,6 +72,87 @@ pub trait TxClient {
     fn transmit_event(&self, buf: &'static mut [u8], result: Result<(), ErrorCode>);
 }
 
+/// Parameters extracted from a BLE CONNECT_IND PDU (Vol 6, Part B §2.3.3.1).
+/// All timing values are in microseconds for hardware-independence.
+#[derive(Copy, Clone)]
+pub struct ConnectionParams {
+    /// Per-connection access address (randomly assigned by the initiator).
+    pub access_address: u32,
+    /// 24-bit CRC initial value from the CONNECT_IND LLData field.
+    pub crc_init: u32,
+    /// 37-bit channel map: bit N set means data channel N is usable.
+    pub channel_map: u64,
+    /// Hop increment (5–16) for the CSA#1 channel selection algorithm.
+    pub hop_increment: u8,
+    /// Connection interval in microseconds (connInterval × 1250 µs).
+    pub conn_interval_us: u32,
+    /// Number of connection events the slave may skip (connSlaveLatency).
+    pub slave_latency: u16,
+    /// Supervision timeout in milliseconds (connSupervisionTimeout × 10 ms).
+    pub supervision_timeout_ms: u32,
+    /// Window size in microseconds (winSize × 1250 µs).
+    pub win_size_us: u32,
+    /// Window offset in microseconds (winOffset × 1250 µs).
+    pub win_offset_us: u32,
+}
+
+/// Low-level driver interface for BLE connection-oriented (data) channel events.
+///
+/// The implementation uses TIMER0 + PPI hardware shortcuts to schedule radio
+/// operations with sub-microsecond accuracy, bypassing kernel scheduling jitter.
+/// TIMER0 runs at 1 MHz (1 µs/tick) once `connection_configure` is called.
+pub trait BleConnectionDriver<'a> {
+    /// Configure the radio for a specific connection.
+    ///
+    /// Sets per-connection access address, CRC init, TIFS=150 µs, and
+    /// initialises TIMER0 at 1 MHz.  Must be called once after receiving
+    /// a CONNECT_IND and before the first `connection_event_start`.
+    fn connection_configure(&self, params: &ConnectionParams) -> Result<(), ErrorCode>;
+
+    /// Schedule a connection event and arm the radio.
+    ///
+    /// The radio will begin ramping up for RX automatically via PPI when
+    /// TIMER0 reaches `open_time_ticks` (1 µs ticks).  `tx_buf` must
+    /// contain a pre-formatted LL PDU (the ACK/empty PDU for this event);
+    /// it is swapped in as the TX DMA pointer during the hardware RX→TX
+    /// transition.
+    fn connection_event_start(
+        &self,
+        channel: RadioChannel,
+        tx_buf: &'static mut [u8],
+        open_time_ticks: u32,
+    ) -> Result<(), ErrorCode>;
+
+    /// Return the current TIMER0 counter value (1 µs ticks).
+    fn get_timer0_now(&self) -> u32;
+
+    fn set_connection_event_client(&self, client: &'a dyn ConnectionEventClient);
+}
+
+/// Callback fired once per connection event (after both RX and TX complete).
+pub trait ConnectionEventClient {
+    /// Called when the full RX-then-TX connection event hardware sequence is done.
+    ///
+    /// * `buf` — the static RX buffer containing the master's PDU (header + payload).
+    /// * `tx_buf` — the TX buffer provided to `connection_event_start`, returned for reuse.
+    /// * `result` — `Ok(())` if the master's PDU had a valid CRC, `Err(FAIL)` otherwise.
+    /// * `anchor_ticks` — TIMER0 tick captured by hardware when the master's access
+    ///   address was detected (PPI CH26).  Zero if the master was not heard.
+    fn connection_event_done(
+        &self,
+        buf: &'static mut [u8],
+        tx_buf: &'static mut [u8],
+        result: Result<(), ErrorCode>,
+        anchor_ticks: u32,
+    );
+}
+
+/// Callback to hand off connection parameters from the advertising capsule
+/// to a connection manager when a CONNECT_IND is received.
+pub trait ConnectionSetupClient {
+    fn connect_ind_received(&self, params: &ConnectionParams, timer0_now: u32);
+}
+
 // Bluetooth Core Specification:Vol. 6. Part B, section 1.4.1 Advertising and Data Channel Indices
 #[derive(PartialEq, Debug, Copy, Clone)]
 pub enum RadioChannel {
@@ -118,6 +199,50 @@ pub enum RadioChannel {
 }
 
 impl RadioChannel {
+    /// Returns the data channel (0-36) variant from a channel index, or None if out of range.
+    pub fn from_data_channel_index(index: u8) -> Option<RadioChannel> {
+        match index {
+            0 => Some(RadioChannel::DataChannel0),
+            1 => Some(RadioChannel::DataChannel1),
+            2 => Some(RadioChannel::DataChannel2),
+            3 => Some(RadioChannel::DataChannel3),
+            4 => Some(RadioChannel::DataChannel4),
+            5 => Some(RadioChannel::DataChannel5),
+            6 => Some(RadioChannel::DataChannel6),
+            7 => Some(RadioChannel::DataChannel7),
+            8 => Some(RadioChannel::DataChannel8),
+            9 => Some(RadioChannel::DataChannel9),
+            10 => Some(RadioChannel::DataChannel10),
+            11 => Some(RadioChannel::DataChannel11),
+            12 => Some(RadioChannel::DataChannel12),
+            13 => Some(RadioChannel::DataChannel13),
+            14 => Some(RadioChannel::DataChannel14),
+            15 => Some(RadioChannel::DataChannel15),
+            16 => Some(RadioChannel::DataChannel16),
+            17 => Some(RadioChannel::DataChannel17),
+            18 => Some(RadioChannel::DataChannel18),
+            19 => Some(RadioChannel::DataChannel19),
+            20 => Some(RadioChannel::DataChannel20),
+            21 => Some(RadioChannel::DataChannel21),
+            22 => Some(RadioChannel::DataChannel22),
+            23 => Some(RadioChannel::DataChannel23),
+            24 => Some(RadioChannel::DataChannel24),
+            25 => Some(RadioChannel::DataChannel25),
+            26 => Some(RadioChannel::DataChannel26),
+            27 => Some(RadioChannel::DataChannel27),
+            28 => Some(RadioChannel::DataChannel28),
+            29 => Some(RadioChannel::DataChannel29),
+            30 => Some(RadioChannel::DataChannel30),
+            31 => Some(RadioChannel::DataChannel31),
+            32 => Some(RadioChannel::DataChannel32),
+            33 => Some(RadioChannel::DataChannel33),
+            34 => Some(RadioChannel::DataChannel34),
+            35 => Some(RadioChannel::DataChannel35),
+            36 => Some(RadioChannel::DataChannel36),
+            _ => None,
+        }
+    }
+
     pub fn get_channel_index(&self) -> u32 {
         match *self {
             RadioChannel::DataChannel0 => 0,

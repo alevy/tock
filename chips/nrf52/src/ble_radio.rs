@@ -43,8 +43,8 @@ use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
 use kernel::ErrorCode;
 use kernel::hil::ble_advertising;
-use kernel::hil::ble_advertising::RadioChannel;
 use kernel::utilities::StaticRef;
+use kernel::hil::ble_advertising::{ConnectionParams, RadioChannel};
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::cells::TakeCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
@@ -533,6 +533,83 @@ register_bitfields! [u32,
     ]
 ];
 
+// ---------------------------------------------------------------------------
+// Minimal TIMER0 register map (base 0x40008000).
+// TIMER0 is used exclusively for BLE connection event timing when connected.
+// Prescaler is set to 4 (1 MHz = 1 µs/tick) on first connection_configure().
+//
+// CC register assignments during connection events:
+//   CC[0]  – radio open_time  (PPI CH21: TIMER0_CC0 → RADIO_RXEN)
+//   CC[1]  – anchor capture   (PPI CH26: RADIO_ADDRESS → TIMER0_CAPTURE[1])
+//   CC[2]  – window timeout   (PPI CH0 programmable: TIMER0_CC2 → RADIO_DISABLE)
+//   CC[3]  – software "now"   (write TASKS_CAPTURE[3], read CC[3])
+// ---------------------------------------------------------------------------
+
+
+const TIMER0_BASE: u32 = 0x40008000;
+
+#[inline(always)]
+unsafe fn timer0_write(offset: u32, val: u32) {
+    core::ptr::write_volatile((TIMER0_BASE + offset) as *mut u32, val);
+}
+
+#[inline(always)]
+fn timer0_read(offset: u32) -> u32 {
+    unsafe { core::ptr::read_volatile((TIMER0_BASE + offset) as *const u32) }
+}
+
+// TIMER0 register offsets
+const T0_TASKS_START:        u32 = 0x000;
+const T0_TASKS_STOP:         u32 = 0x004;
+const T0_TASKS_CLEAR:        u32 = 0x00C;
+const T0_TASKS_CAPTURE_BASE: u32 = 0x040; // [n] = 0x040 + n*4
+const T0_BITMODE:            u32 = 0x508;
+const T0_PRESCALER:          u32 = 0x510;
+const T0_CC_BASE:            u32 = 0x540; // [n] = 0x540 + n*4
+const T0_EVENTS_COMPARE_BASE: u32 = 0x140; // [n] = 0x140 + n*4
+
+// PPI register helpers
+const PPI_BASE:     u32 = 0x4001F000;
+const PPI_CHENSET:  u32 = 0x504;
+const PPI_CHENCLR:  u32 = 0x508;
+const PPI_CH_EEP_BASE: u32 = 0x510; // CH[0].EEP; CH[n].EEP = 0x510 + n*8
+
+// Absolute hardware addresses used for PPI CH0 endpoint configuration:
+//   EEP: TIMER0 EVENTS_COMPARE[2] = 0x40008000 + 0x148
+//   TEP: RADIO  TASKS_DISABLE     = 0x40001000 + 0x010
+const TIMER0_EVENTS_COMPARE2_ADDR: u32 = 0x40008148;
+const RADIO_TASKS_DISABLE_ADDR:    u32 = 0x40001010;
+
+// PPI channel masks for chenset/chenclr
+const PPI_CH0:  u32 = 1 << 0;  // programmable: TIMER0_CC2 → RADIO_DISABLE
+const PPI_CH21: u32 = 1 << 21; // pre-programmed: TIMER0_CC0 → RADIO_RXEN
+const PPI_CH26: u32 = 1 << 26; // pre-programmed: RADIO_ADDRESS → TIMER0_CAPTURE[1]
+
+#[inline(always)]
+fn ppi_enable(mask: u32) {
+    unsafe { core::ptr::write_volatile((PPI_BASE + PPI_CHENSET) as *mut u32, mask); }
+}
+
+#[inline(always)]
+fn ppi_disable(mask: u32) {
+    unsafe { core::ptr::write_volatile((PPI_BASE + PPI_CHENCLR) as *mut u32, mask); }
+}
+
+#[inline(always)]
+unsafe fn ppi_configure_ch0(eep: u32, tep: u32) {
+    // CH[0].EEP = PPI_BASE + 0x510, CH[0].TEP = PPI_BASE + 0x514
+    core::ptr::write_volatile((PPI_BASE + PPI_CH_EEP_BASE) as *mut u32, eep);
+    core::ptr::write_volatile((PPI_BASE + PPI_CH_EEP_BASE + 4) as *mut u32, tep);
+}
+
+/// Phase of the current connection event.
+#[derive(Copy, Clone, PartialEq)]
+enum ConnPhase {
+    Idle,
+    Rx,  // listening for master's PDU
+    Tx,  // transmitting ACK (hardware-driven via SHORTS)
+}
+
 static mut PAYLOAD: [u8; nrf5x::constants::RADIO_PAYLOAD_LENGTH] =
     [0x00; nrf5x::constants::RADIO_PAYLOAD_LENGTH];
 
@@ -542,6 +619,13 @@ pub struct Radio<'a> {
     rx_client: OptionalCell<&'a dyn ble_advertising::RxClient>,
     tx_client: OptionalCell<&'a dyn ble_advertising::TxClient>,
     buffer: TakeCell<'static, [u8]>,
+    // Connection mode fields
+    conn_client: OptionalCell<&'a dyn ble_advertising::ConnectionEventClient>,
+    conn_tx_buf: TakeCell<'static, [u8]>,
+    conn_phase: Cell<ConnPhase>,
+    conn_rx_ok: Cell<bool>,
+    conn_anchor_ticks: Cell<u32>,
+    conn_params: Cell<Option<ConnectionParams>>,
 }
 
 impl<'a> Radio<'a> {
@@ -552,6 +636,12 @@ impl<'a> Radio<'a> {
             rx_client: OptionalCell::empty(),
             tx_client: OptionalCell::empty(),
             buffer: TakeCell::empty(),
+            conn_client: OptionalCell::empty(),
+            conn_tx_buf: TakeCell::empty(),
+            conn_phase: Cell::new(ConnPhase::Idle),
+            conn_rx_ok: Cell::new(false),
+            conn_anchor_ticks: Cell::new(0),
+            conn_params: Cell::new(None),
         }
     }
 
@@ -603,6 +693,89 @@ impl<'a> Radio<'a> {
     pub fn handle_interrupt(&self) {
         self.disable_all_interrupts();
 
+        // ---------------------------------------------------------------
+        // Connection-event path: hardware handles RX→TX via SHORTS.
+        // We handle two DISABLED interrupts per event:
+        //   1st DISABLED (after RX): swap PACKETPTR to tx_buf for the TX.
+        //   2nd DISABLED (after TX): notify the client.
+        // ---------------------------------------------------------------
+        if self.conn_phase.get() != ConnPhase::Idle {
+            // Record CRC result once, after the RX END event.
+            if self.registers.event_end.is_set(Event::READY)
+                && self.conn_phase.get() == ConnPhase::Rx
+            {
+                self.registers.event_end.write(Event::READY::CLEAR);
+                self.conn_rx_ok
+                    .set(self.registers.crcstatus.is_set(Event::READY));
+                // Capture anchor: PPI CH26 wrote TIMER0 CC[1] on RADIO_ADDRESS.
+                // Read it now while still in the RX END interrupt context.
+                self.conn_anchor_ticks
+                    .set(timer0_read(T0_CC_BASE + 1 * 4));
+            }
+
+            if self.registers.event_disabled.is_set(Event::READY) {
+                self.registers.event_disabled.write(Event::READY::CLEAR);
+
+                match self.conn_phase.get() {
+                    ConnPhase::Rx => {
+                        // RX done, DISABLED_TXEN shortcut has already started TX
+                        // ramp-up.  We have ~40 µs before READY fires to swap
+                        // PACKETPTR to the pre-loaded TX PDU buffer.
+                        if let Some(ptr) = self.conn_tx_buf.map(|b| b.as_ptr() as u32) {
+                            self.registers.packetptr.set(ptr);
+                        }
+                        // Remove DISABLED_TXEN so the post-TX DISABLED doesn't
+                        // re-trigger another TX automatically.
+                        self.registers.shorts.write(
+                            Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET,
+                        );
+                        // Disable the window-timeout PPI now that RX succeeded
+                        // (or timed out—either way the radio is past the RX phase).
+                        ppi_disable(PPI_CH0);
+                        self.conn_phase.set(ConnPhase::Tx);
+                        self.registers
+                            .intenset
+                            .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+                    }
+                    ConnPhase::Tx => {
+                        // TX done.  Clean up and notify the client.
+                        ppi_disable(PPI_CH21 | PPI_CH26);
+                        self.registers.shorts.write(/* clear */ Shortcut::READY_START::CLEAR);
+                        self.conn_phase.set(ConnPhase::Idle);
+                        self.radio_off();
+
+                        let result = if self.conn_rx_ok.get() {
+                            Ok(())
+                        } else {
+                            Err(ErrorCode::FAIL)
+                        };
+                        let anchor = self.conn_anchor_ticks.get();
+
+                        unsafe {
+                            self.conn_client.map(|client| {
+                                client.connection_event_done(
+                                    &mut *addr_of_mut!(PAYLOAD),
+                                    self.conn_tx_buf.take().unwrap(),
+                                    result,
+                                    anchor,
+                                )
+                            });
+                        }
+                    }
+                    ConnPhase::Idle => {}
+                }
+            } else {
+                // Re-arm interrupts if we didn't handle DISABLED yet.
+                self.registers
+                    .intenset
+                    .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+            }
+            return;
+        }
+
+        // ---------------------------------------------------------------
+        // Advertising / scanning path (unchanged).
+        // ---------------------------------------------------------------
         if self.registers.event_ready.is_set(Event::READY) {
             self.registers.event_ready.write(Event::READY::CLEAR);
             self.registers.event_end.write(Event::READY::CLEAR);
@@ -793,6 +966,135 @@ impl<'a> Radio<'a> {
     fn ble_set_tx_power(&self) {
         self.set_tx_power();
     }
+
+    fn timer0_init(&self) {
+        unsafe {
+            timer0_write(T0_TASKS_STOP, 1);
+            timer0_write(T0_PRESCALER, 4); // 16 MHz / 2^4 = 1 MHz (1 µs/tick)
+            timer0_write(T0_BITMODE, 3);   // 32-bit
+            timer0_write(T0_TASKS_CLEAR, 1);
+            timer0_write(T0_TASKS_START, 1);
+        }
+    }
+
+    fn connection_configure_impl(&self, params: &ConnectionParams) {
+        self.conn_params.set(Some(*params));
+        self.timer0_init();
+        // PPI CH0 (programmable): TIMER0_EVENTS_COMPARE[2] → RADIO_TASKS_DISABLE
+        unsafe {
+            ppi_configure_ch0(TIMER0_EVENTS_COMPARE2_ADDR, RADIO_TASKS_DISABLE_ADDR);
+        }
+    }
+
+    fn connection_event_start_impl(
+        &self,
+        channel: RadioChannel,
+        tx_buf: &'static mut [u8],
+        open_time_ticks: u32,
+    ) -> Result<(), ErrorCode> {
+        let params = match self.conn_params.get() {
+            Some(p) => p,
+            None => return Err(ErrorCode::FAIL),
+        };
+
+        if self.conn_phase.get() != ConnPhase::Idle {
+            return Err(ErrorCode::BUSY);
+        }
+
+        self.conn_tx_buf.replace(tx_buf);
+        self.conn_rx_ok.set(false);
+
+        // Power-cycle resets all radio registers; reconfigure fully each event.
+        self.radio_on();
+
+        // Per-connection access address (BALEN=3: base0 = lower 3 bytes << 8,
+        // prefix0 AP0 = MSB of access address).
+        self.registers
+            .base0
+            .set((params.access_address & 0x00FF_FFFF) << 8);
+        self.registers
+            .prefix0
+            .set((params.access_address >> 24) & 0xFF);
+
+        // CRC: 3 bytes, exclude access address, per-connection init value
+        self.registers.crccnf.write(
+            CrcConfiguration::LEN::THREE + CrcConfiguration::SKIPADDR::EXCLUDE,
+        );
+        self.registers.crcpoly.set(nrf5x::constants::RADIO_CRCPOLY_BLE);
+        self.registers
+            .crcinit
+            .write(CrcInitialValue::CRCINIT.val(params.crc_init));
+
+        // T_IFS = 150 µs (hardware-enforced inter-frame spacing for RX→TX)
+        self.registers.tifs.write(InterFrameSpacing::TIFS.val(150));
+
+        self.registers.mode.write(Mode::MODE::BLE_1MBIT);
+
+        self.registers.pcnf0.write(
+            PacketConfiguration0::LFLEN.val(8)
+                + PacketConfiguration0::S0LEN.val(1)
+                + PacketConfiguration0::S1LEN::CLEAR
+                + PacketConfiguration0::S1INCL::CLEAR
+                + PacketConfiguration0::PLEN::EIGHT,
+        );
+        self.registers.pcnf1.write(
+            PacketConfiguration1::WHITEEN::ENABLED
+                + PacketConfiguration1::ENDIAN::LITTLE
+                + PacketConfiguration1::BALEN.val(3)
+                + PacketConfiguration1::STATLEN::CLEAR
+                + PacketConfiguration1::MAXLEN.val(255),
+        );
+
+        self.registers
+            .txaddress
+            .write(TransmitAddress::ADDRESS.val(0));
+        self.registers
+            .rxaddresses
+            .write(ReceiveAddresses::ADDRESS.val(1));
+
+        self.set_tx_power();
+        self.ble_set_channel_freq(channel);
+        self.ble_set_data_whitening(channel);
+        self.set_dma_ptr();
+
+        // SHORTS: READY→START (auto-start on ramp-up), END→DISABLE (packet done),
+        // DISABLED→TXEN (hardware T_IFS transition for the ACK).
+        self.registers.shorts.write(
+            Shortcut::READY_START::SET
+                + Shortcut::END_DISABLE::SET
+                + Shortcut::DISABLED_TXEN::SET,
+        );
+
+        unsafe {
+            // Clear any stale compare events before (re-)enabling PPI channels.
+            timer0_write(T0_EVENTS_COMPARE_BASE, 0);
+            timer0_write(T0_EVENTS_COMPARE_BASE + 2 * 4, 0);
+
+            // CC[0]: PPI CH21 fires RADIO_RXEN when TIMER0 reaches this value.
+            timer0_write(T0_CC_BASE, open_time_ticks);
+
+            // CC[2]: window-timeout guard (2 ms after open_time).
+            // PPI CH0 fires RADIO_TASKS_DISABLE if the master never arrives.
+            timer0_write(T0_CC_BASE + 2 * 4, open_time_ticks.wrapping_add(2000));
+        }
+
+        ppi_enable(PPI_CH0 | PPI_CH21 | PPI_CH26);
+
+        self.registers
+            .intenset
+            .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+        self.conn_phase.set(ConnPhase::Rx);
+
+        Ok(())
+    }
+
+    fn get_timer0_now_impl(&self) -> u32 {
+        // Trigger TASKS_CAPTURE[3] to latch current counter into CC[3], then read CC[3].
+        unsafe {
+            timer0_write(T0_TASKS_CAPTURE_BASE + 3 * 4, 1);
+        }
+        timer0_read(T0_CC_BASE + 3 * 4)
+    }
 }
 
 impl<'a> ble_advertising::BleAdvertisementDriver<'a> for Radio<'a> {
@@ -833,5 +1135,29 @@ impl ble_advertising::BleConfig for Radio<'_> {
                 Ok(())
             }
         }
+    }
+}
+
+impl<'a> ble_advertising::BleConnectionDriver<'a> for Radio<'a> {
+    fn connection_configure(&self, params: &ConnectionParams) -> Result<(), ErrorCode> {
+        self.connection_configure_impl(params);
+        Ok(())
+    }
+
+    fn connection_event_start(
+        &self,
+        channel: RadioChannel,
+        tx_buf: &'static mut [u8],
+        open_time_ticks: u32,
+    ) -> Result<(), ErrorCode> {
+        self.connection_event_start_impl(channel, tx_buf, open_time_ticks)
+    }
+
+    fn get_timer0_now(&self) -> u32 {
+        self.get_timer0_now_impl()
+    }
+
+    fn set_connection_event_client(&self, client: &'a dyn ble_advertising::ConnectionEventClient) {
+        self.conn_client.set(client);
     }
 }

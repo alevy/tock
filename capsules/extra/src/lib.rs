@@ -22,6 +22,7 @@ pub mod app_loader;
 pub mod at24c_eeprom;
 pub mod atecc508a;
 pub mod ble_advertising_driver;
+pub mod ble_ll_connection;
 pub mod bme280;
 pub mod bmm150;
 pub mod bmp280;
