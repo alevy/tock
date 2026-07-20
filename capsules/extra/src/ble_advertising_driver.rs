@@ -112,7 +112,9 @@ use core::cmp;
 use kernel::debug;
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, GrantKernelData, UpcallCount};
 use kernel::hil::ble_advertising;
-use kernel::hil::ble_advertising::RadioChannel;
+use kernel::hil::ble_advertising::{
+    ConnectionParams, ConnectionSetupClient, RadioChannel,
+};
 use kernel::hil::time::{Frequency, Ticks};
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
@@ -323,6 +325,40 @@ impl App {
     }
 }
 
+// Parse a CONNECT_IND PDU (BT Core Spec Vol 6 Part B §2.3.3.1).
+// buf must include the 2-byte PDU header (S0 + LENGTH) followed by the payload.
+fn parse_connect_ind(buf: &[u8]) -> Option<ConnectionParams> {
+    // Minimum CONNECT_IND length: 2-byte header + 34-byte payload = 36 bytes
+    if buf.len() < 36 {
+        return None;
+    }
+    let access_address = u32::from_le_bytes([buf[14], buf[15], buf[16], buf[17]]);
+    let crc_init =
+        (buf[18] as u32) | ((buf[19] as u32) << 8) | ((buf[20] as u32) << 16);
+    let win_size_us = buf[21] as u32 * 1250;
+    let win_offset_us = u16::from_le_bytes([buf[22], buf[23]]) as u32 * 1250;
+    let conn_interval_us = u16::from_le_bytes([buf[24], buf[25]]) as u32 * 1250;
+    let slave_latency = u16::from_le_bytes([buf[26], buf[27]]);
+    let supervision_timeout_ms = u16::from_le_bytes([buf[28], buf[29]]) as u32 * 10;
+    let channel_map = (buf[30] as u64)
+        | ((buf[31] as u64) << 8)
+        | ((buf[32] as u64) << 16)
+        | ((buf[33] as u64) << 24)
+        | ((buf[34] as u64) << 32);
+    let hop_increment = buf[35] & 0x1F;
+    Some(ConnectionParams {
+        access_address,
+        crc_init,
+        channel_map,
+        hop_increment,
+        conn_interval_us,
+        slave_latency,
+        supervision_timeout_ms,
+        win_size_us,
+        win_offset_us,
+    })
+}
+
 pub struct BLE<'a, B, A>
 where
     B: ble_advertising::BleAdvertisementDriver<'a> + ble_advertising::BleConfig,
@@ -340,6 +376,10 @@ where
     alarm: &'a A,
     sending_app: OptionalCell<kernel::ProcessId>,
     receiving_app: OptionalCell<kernel::ProcessId>,
+    // Optional connection support: when set, CONNECT_IND PDUs received during
+    // scanning are parsed and handed off to the connection manager.
+    conn_driver: OptionalCell<&'a dyn ble_advertising::BleConnectionDriver<'a>>,
+    setup_client: OptionalCell<&'a dyn ConnectionSetupClient>,
 }
 
 impl<'a, B, A> BLE<'a, B, A>
@@ -366,7 +406,18 @@ where
             alarm,
             sending_app: OptionalCell::empty(),
             receiving_app: OptionalCell::empty(),
+            conn_driver: OptionalCell::empty(),
+            setup_client: OptionalCell::empty(),
         }
+    }
+
+    pub fn set_connection_driver(
+        &self,
+        driver: &'a dyn ble_advertising::BleConnectionDriver<'a>,
+        client: &'a dyn ConnectionSetupClient,
+    ) {
+        self.conn_driver.set(driver);
+        self.setup_client.set(client);
     }
 
     // Determines which app timer will expire next and sets the underlying alarm
@@ -483,6 +534,31 @@ where
     A: kernel::hil::time::Alarm<'a>,
 {
     fn receive_event(&self, buf: &'static mut [u8], len: u8, result: Result<(), ErrorCode>) {
+        // Check for CONNECT_IND (PDU type 0x05) before anything else.
+        // When a central sends CONNECT_IND (connectable undirected advertising response),
+        // parse the connection parameters and hand them off to the connection manager.
+        if result.is_ok() && len >= 36 && (buf[0] & 0x0F) == CONNECT_IND {
+            if let Some(params) = parse_connect_ind(&buf[0..len as usize]) {
+                self.conn_driver.map(|driver| {
+                    let _ = driver.connection_configure(&params);
+                    let t0 = driver.get_timer0_now();
+                    self.setup_client.map(|client| {
+                        client.connect_ind_received(&params, t0);
+                    });
+                });
+                // Stop advertising/scanning; the connection manager takes over.
+                self.receiving_app.map(|processid| {
+                    let _ = self.app.enter(processid, |app, _| {
+                        app.process_status = Some(BLEState::Idle);
+                        app.alarm_data.expiration = Expiration::Disabled;
+                    });
+                });
+                self.receiving_app.take();
+                self.busy.set(false);
+                return;
+            }
+        }
+
         self.receiving_app.map(|processid| {
             let _ = self.app.enter(processid, |app, kernel_data| {
                 // Validate the received data, because ordinary BLE packets can be bigger than 39
