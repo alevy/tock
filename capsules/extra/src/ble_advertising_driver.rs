@@ -112,9 +112,7 @@ use core::cmp;
 use kernel::debug;
 use kernel::grant::{AllowRoCount, AllowRwCount, Grant, GrantKernelData, UpcallCount};
 use kernel::hil::ble_advertising;
-use kernel::hil::ble_advertising::{
-    ConnectionParams, ConnectionSetupClient, RadioChannel,
-};
+use kernel::hil::ble_advertising::{ConnectionParams, ConnectionSetupClient, RadioChannel};
 use kernel::hil::time::{Frequency, Ticks};
 use kernel::processbuffer::{ReadableProcessBuffer, WriteableProcessBuffer};
 use kernel::syscall::{CommandReturn, SyscallDriver};
@@ -335,8 +333,7 @@ fn parse_connect_ind(buf: &[u8]) -> Option<ConnectionParams> {
         return None;
     }
     let access_address = u32::from_le_bytes([buf[14], buf[15], buf[16], buf[17]]);
-    let crc_init =
-        (buf[18] as u32) | ((buf[19] as u32) << 8) | ((buf[20] as u32) << 16);
+    let crc_init = (buf[18] as u32) | ((buf[19] as u32) << 8) | ((buf[20] as u32) << 16);
     let win_size_us = buf[21] as u32 * 1250;
     let win_offset_us = u16::from_le_bytes([buf[22], buf[23]]) as u32 * 1250;
     let conn_interval_us = u16::from_le_bytes([buf[24], buf[25]]) as u32 * 1250;
@@ -498,9 +495,8 @@ where
                         // AdvertisingRx timeout: CONNECT_IND never arrived; move to next channel.
                         Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
                             self.radio.stop_receive();
-                            app.process_status = Some(BLEState::Advertising(
-                                RadioChannel::AdvertisingChannel38,
-                            ));
+                            app.process_status =
+                                Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38));
                             self.receiving_app.take();
                             self.sending_app.set(processid);
                             let _ = self.radio.set_tx_power(app.tx_power);
@@ -513,9 +509,8 @@ where
                         }
                         Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
                             self.radio.stop_receive();
-                            app.process_status = Some(BLEState::Advertising(
-                                RadioChannel::AdvertisingChannel39,
-                            ));
+                            app.process_status =
+                                Some(BLEState::Advertising(RadioChannel::AdvertisingChannel39));
                             self.receiving_app.take();
                             self.sending_app.set(processid);
                             let _ = app.send_advertisement(
@@ -656,9 +651,8 @@ where
                     // channel (or back to idle after ch39).
                     Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
                         app.alarm_data.expiration = Expiration::Disabled;
-                        app.process_status = Some(BLEState::Advertising(
-                            RadioChannel::AdvertisingChannel38,
-                        ));
+                        app.process_status =
+                            Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38));
                         self.receiving_app.take();
                         self.sending_app.set(processid);
                         let _ = self.radio.set_tx_power(app.tx_power);
@@ -671,9 +665,8 @@ where
                     }
                     Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
                         app.alarm_data.expiration = Expiration::Disabled;
-                        app.process_status = Some(BLEState::Advertising(
-                            RadioChannel::AdvertisingChannel39,
-                        ));
+                        app.process_status =
+                            Some(BLEState::Advertising(RadioChannel::AdvertisingChannel39));
                         self.receiving_app.take();
                         self.sending_app.set(processid);
                         let _ = app.send_advertisement(
@@ -759,9 +752,7 @@ where
                                 RadioChannel::AdvertisingChannel39 => {
                                     self.busy.set(false);
                                     app.process_status = Some(BLEState::AdvertisingIdle);
-                                    app.set_next_alarm::<A::Frequency>(
-                                        self.alarm.now().into_u32(),
-                                    );
+                                    app.set_next_alarm::<A::Frequency>(self.alarm.now().into_u32());
                                 }
                                 _ => (),
                             }

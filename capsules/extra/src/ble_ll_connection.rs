@@ -21,13 +21,13 @@
 
 use core::cell::Cell;
 
+use kernel::ErrorCode;
 use kernel::hil::ble_advertising::{
     BleConnectionDriver, ConnectionEventClient, ConnectionParams, ConnectionSetupClient,
     RadioChannel,
 };
 use kernel::hil::time::{Alarm, AlarmClient};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::ErrorCode;
 
 // Combined SCA: assume ±500 ppm master + ±500 ppm slave = ±1000 ppm worst-case.
 const COMBINED_SCA_PPM: u32 = 1000;
