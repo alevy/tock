@@ -26,7 +26,7 @@ use kernel::hil::ble_advertising::{
     BleConnectionDriver, ConnectionEventClient, ConnectionParams, ConnectionSetupClient,
     RadioChannel,
 };
-use kernel::hil::time::{Alarm, AlarmClient};
+use kernel::hil::time::{Alarm, AlarmClient, ConvertTicks};
 use kernel::utilities::cells::{OptionalCell, TakeCell};
 
 // Combined SCA: assume ±500 ppm master + ±500 ppm slave = ±1000 ppm worst-case.
@@ -177,11 +177,13 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             .wrapping_sub(widening + WINDOW_GUARD_US);
 
         // Arm the alarm so the CPU wakes up TIMER_SETUP_TICKS before open_time.
-        let wakeup = open_time.wrapping_sub(TIMER_SETUP_TICKS);
-        self.alarm.set_alarm(
-            A::Ticks::from(wakeup),
-            A::Ticks::from(0), // fire at exactly wakeup
-        );
+        // TIMER0 runs at 1 MHz (1 µs/tick); compute how many µs remain and
+        // convert to the alarm's native tick frequency.
+        let wakeup_us = open_time.wrapping_sub(TIMER_SETUP_TICKS);
+        let now_us = self.driver.get_timer0_now();
+        let delta_us = wakeup_us.wrapping_sub(now_us).min(interval_us * 2);
+        let dt = self.alarm.ticks_from_us(delta_us);
+        self.alarm.set_alarm(self.alarm.now(), dt);
     }
 
     fn declare_connection_lost(&self) {
