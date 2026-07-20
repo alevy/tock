@@ -226,7 +226,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionSetupClient
         self.last_anchor_ticks.set(first_anchor);
 
         // Prepare a TX buffer for the first event.
-        self.tx_buf.map(|buf| write_empty_ack(buf));
+        self.tx_buf.map(write_empty_ack);
 
         // Schedule the first event.
         self.schedule_next_event(params);
