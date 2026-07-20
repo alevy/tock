@@ -58,6 +58,11 @@ pub trait BleAdvertisementDriver<'a> {
     fn receive_advertisement(&self, channel: RadioChannel);
     fn set_receive_client(&self, client: &'a dyn RxClient);
     fn set_transmit_client(&self, client: &'a dyn TxClient);
+    /// Abort an in-progress receive started by `receive_advertisement`.
+    /// After this call no `RxClient::receive_event` callback will fire for
+    /// the aborted receive.  The default implementation is a no-op for
+    /// drivers that do not support connectable advertising.
+    fn stop_receive(&self) {}
 }
 
 pub trait BleConfig {
