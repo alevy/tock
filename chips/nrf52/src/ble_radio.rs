@@ -43,8 +43,8 @@ use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
 use kernel::ErrorCode;
 use kernel::hil::ble_advertising;
-use kernel::utilities::StaticRef;
 use kernel::hil::ble_advertising::{ConnectionParams, RadioChannel};
+use kernel::utilities::StaticRef;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::cells::TakeCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
@@ -545,7 +545,6 @@ register_bitfields! [u32,
 //   CC[3]  – software "now"   (write TASKS_CAPTURE[3], read CC[3])
 // ---------------------------------------------------------------------------
 
-
 const TIMER0_BASE: u32 = 0x40008000;
 
 #[inline(always)]
@@ -559,40 +558,44 @@ fn timer0_read(offset: u32) -> u32 {
 }
 
 // TIMER0 register offsets
-const T0_TASKS_START:        u32 = 0x000;
-const T0_TASKS_STOP:         u32 = 0x004;
-const T0_TASKS_CLEAR:        u32 = 0x00C;
+const T0_TASKS_START: u32 = 0x000;
+const T0_TASKS_STOP: u32 = 0x004;
+const T0_TASKS_CLEAR: u32 = 0x00C;
 const T0_TASKS_CAPTURE_BASE: u32 = 0x040; // [n] = 0x040 + n*4
-const T0_BITMODE:            u32 = 0x508;
-const T0_PRESCALER:          u32 = 0x510;
-const T0_CC_BASE:            u32 = 0x540; // [n] = 0x540 + n*4
+const T0_BITMODE: u32 = 0x508;
+const T0_PRESCALER: u32 = 0x510;
+const T0_CC_BASE: u32 = 0x540; // [n] = 0x540 + n*4
 const T0_EVENTS_COMPARE_BASE: u32 = 0x140; // [n] = 0x140 + n*4
 
 // PPI register helpers
-const PPI_BASE:     u32 = 0x4001F000;
-const PPI_CHENSET:  u32 = 0x504;
-const PPI_CHENCLR:  u32 = 0x508;
+const PPI_BASE: u32 = 0x4001F000;
+const PPI_CHENSET: u32 = 0x504;
+const PPI_CHENCLR: u32 = 0x508;
 const PPI_CH_EEP_BASE: u32 = 0x510; // CH[0].EEP; CH[n].EEP = 0x510 + n*8
 
 // Absolute hardware addresses used for PPI CH0 endpoint configuration:
 //   EEP: TIMER0 EVENTS_COMPARE[2] = 0x40008000 + 0x148
 //   TEP: RADIO  TASKS_DISABLE     = 0x40001000 + 0x010
 const TIMER0_EVENTS_COMPARE2_ADDR: u32 = 0x40008148;
-const RADIO_TASKS_DISABLE_ADDR:    u32 = 0x40001010;
+const RADIO_TASKS_DISABLE_ADDR: u32 = 0x40001010;
 
 // PPI channel masks for chenset/chenclr
-const PPI_CH0:  u32 = 1 << 0;  // programmable: TIMER0_CC2 → RADIO_DISABLE
+const PPI_CH0: u32 = 1 << 0; // programmable: TIMER0_CC2 → RADIO_DISABLE
 const PPI_CH21: u32 = 1 << 21; // pre-programmed: TIMER0_CC0 → RADIO_RXEN
 const PPI_CH26: u32 = 1 << 26; // pre-programmed: RADIO_ADDRESS → TIMER0_CAPTURE[1]
 
 #[inline(always)]
 fn ppi_enable(mask: u32) {
-    unsafe { core::ptr::write_volatile((PPI_BASE + PPI_CHENSET) as *mut u32, mask); }
+    unsafe {
+        core::ptr::write_volatile((PPI_BASE + PPI_CHENSET) as *mut u32, mask);
+    }
 }
 
 #[inline(always)]
 fn ppi_disable(mask: u32) {
-    unsafe { core::ptr::write_volatile((PPI_BASE + PPI_CHENCLR) as *mut u32, mask); }
+    unsafe {
+        core::ptr::write_volatile((PPI_BASE + PPI_CHENCLR) as *mut u32, mask);
+    }
 }
 
 #[inline(always)]
@@ -606,8 +609,8 @@ unsafe fn ppi_configure_ch0(eep: u32, tep: u32) {
 #[derive(Copy, Clone, PartialEq)]
 enum ConnPhase {
     Idle,
-    Rx,  // listening for master's PDU
-    Tx,  // transmitting ACK (hardware-driven via SHORTS)
+    Rx, // listening for master's PDU
+    Tx, // transmitting ACK (hardware-driven via SHORTS)
 }
 
 static mut PAYLOAD: [u8; nrf5x::constants::RADIO_PAYLOAD_LENGTH] =
@@ -709,8 +712,7 @@ impl<'a> Radio<'a> {
                     .set(self.registers.crcstatus.is_set(Event::READY));
                 // Capture anchor: PPI CH26 wrote TIMER0 CC[1] on RADIO_ADDRESS.
                 // Read it now while still in the RX END interrupt context.
-                self.conn_anchor_ticks
-                    .set(timer0_read(T0_CC_BASE + 1 * 4));
+                self.conn_anchor_ticks.set(timer0_read(T0_CC_BASE + 1 * 4));
             }
 
             if self.registers.event_disabled.is_set(Event::READY) {
@@ -726,9 +728,9 @@ impl<'a> Radio<'a> {
                         }
                         // Remove DISABLED_TXEN so the post-TX DISABLED doesn't
                         // re-trigger another TX automatically.
-                        self.registers.shorts.write(
-                            Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET,
-                        );
+                        self.registers
+                            .shorts
+                            .write(Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET);
                         // Disable the window-timeout PPI now that RX succeeded
                         // (or timed out—either way the radio is past the RX phase).
                         ppi_disable(PPI_CH0);
@@ -740,7 +742,9 @@ impl<'a> Radio<'a> {
                     ConnPhase::Tx => {
                         // TX done.  Clean up and notify the client.
                         ppi_disable(PPI_CH21 | PPI_CH26);
-                        self.registers.shorts.write(/* clear */ Shortcut::READY_START::CLEAR);
+                        self.registers
+                            .shorts
+                            .write(/* clear */ Shortcut::READY_START::CLEAR);
                         self.conn_phase.set(ConnPhase::Idle);
                         self.radio_off();
 
@@ -971,7 +975,7 @@ impl<'a> Radio<'a> {
         unsafe {
             timer0_write(T0_TASKS_STOP, 1);
             timer0_write(T0_PRESCALER, 4); // 16 MHz / 2^4 = 1 MHz (1 µs/tick)
-            timer0_write(T0_BITMODE, 3);   // 32-bit
+            timer0_write(T0_BITMODE, 3); // 32-bit
             timer0_write(T0_TASKS_CLEAR, 1);
             timer0_write(T0_TASKS_START, 1);
         }
@@ -1017,10 +1021,12 @@ impl<'a> Radio<'a> {
             .set((params.access_address >> 24) & 0xFF);
 
         // CRC: 3 bytes, exclude access address, per-connection init value
-        self.registers.crccnf.write(
-            CrcConfiguration::LEN::THREE + CrcConfiguration::SKIPADDR::EXCLUDE,
-        );
-        self.registers.crcpoly.set(nrf5x::constants::RADIO_CRCPOLY_BLE);
+        self.registers
+            .crccnf
+            .write(CrcConfiguration::LEN::THREE + CrcConfiguration::SKIPADDR::EXCLUDE);
+        self.registers
+            .crcpoly
+            .set(nrf5x::constants::RADIO_CRCPOLY_BLE);
         self.registers
             .crcinit
             .write(CrcInitialValue::CRCINIT.val(params.crc_init));
@@ -1060,9 +1066,7 @@ impl<'a> Radio<'a> {
         // SHORTS: READY→START (auto-start on ramp-up), END→DISABLE (packet done),
         // DISABLED→TXEN (hardware T_IFS transition for the ACK).
         self.registers.shorts.write(
-            Shortcut::READY_START::SET
-                + Shortcut::END_DISABLE::SET
-                + Shortcut::DISABLED_TXEN::SET,
+            Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET + Shortcut::DISABLED_TXEN::SET,
         );
 
         unsafe {
