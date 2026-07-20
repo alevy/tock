@@ -151,6 +151,8 @@ enum BLEState {
     Scanning(RadioChannel),
     AdvertisingIdle,
     Advertising(RadioChannel),
+    /// Listening for CONNECT_IND on the same channel after transmitting ADV_IND.
+    AdvertisingRx(RadioChannel),
 }
 
 #[derive(Copy, Clone)]
@@ -493,6 +495,43 @@ where
                     app.alarm_data.expiration = Expiration::Disabled;
 
                     match app.process_status {
+                        // AdvertisingRx timeout: CONNECT_IND never arrived; move to next channel.
+                        Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
+                            self.radio.stop_receive();
+                            app.process_status = Some(BLEState::Advertising(
+                                RadioChannel::AdvertisingChannel38,
+                            ));
+                            self.receiving_app.take();
+                            self.sending_app.set(processid);
+                            let _ = self.radio.set_tx_power(app.tx_power);
+                            let _ = app.send_advertisement(
+                                processid,
+                                kernel_data,
+                                self,
+                                RadioChannel::AdvertisingChannel38,
+                            );
+                        }
+                        Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
+                            self.radio.stop_receive();
+                            app.process_status = Some(BLEState::Advertising(
+                                RadioChannel::AdvertisingChannel39,
+                            ));
+                            self.receiving_app.take();
+                            self.sending_app.set(processid);
+                            let _ = app.send_advertisement(
+                                processid,
+                                kernel_data,
+                                self,
+                                RadioChannel::AdvertisingChannel39,
+                            );
+                        }
+                        Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel39)) => {
+                            self.radio.stop_receive();
+                            self.busy.set(false);
+                            self.receiving_app.take();
+                            app.process_status = Some(BLEState::AdvertisingIdle);
+                            app.set_next_alarm::<A::Frequency>(self.alarm.now().into_u32());
+                        }
                         Some(BLEState::AdvertisingIdle) => {
                             self.busy.set(true);
                             app.process_status =
@@ -613,6 +652,44 @@ where
                         app.process_status = Some(BLEState::ScanningIdle);
                         app.set_next_alarm::<A::Frequency>(self.alarm.now().into_u32());
                     }
+                    // Non-CONNECT_IND received while listening after ADV_IND TX: advance to next
+                    // channel (or back to idle after ch39).
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
+                        app.alarm_data.expiration = Expiration::Disabled;
+                        app.process_status = Some(BLEState::Advertising(
+                            RadioChannel::AdvertisingChannel38,
+                        ));
+                        self.receiving_app.take();
+                        self.sending_app.set(processid);
+                        let _ = self.radio.set_tx_power(app.tx_power);
+                        let _ = app.send_advertisement(
+                            processid,
+                            kernel_data,
+                            self,
+                            RadioChannel::AdvertisingChannel38,
+                        );
+                    }
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
+                        app.alarm_data.expiration = Expiration::Disabled;
+                        app.process_status = Some(BLEState::Advertising(
+                            RadioChannel::AdvertisingChannel39,
+                        ));
+                        self.receiving_app.take();
+                        self.sending_app.set(processid);
+                        let _ = app.send_advertisement(
+                            processid,
+                            kernel_data,
+                            self,
+                            RadioChannel::AdvertisingChannel39,
+                        );
+                    }
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel39)) => {
+                        app.alarm_data.expiration = Expiration::Disabled;
+                        self.busy.set(false);
+                        self.receiving_app.take();
+                        app.process_status = Some(BLEState::AdvertisingIdle);
+                        app.set_next_alarm::<A::Frequency>(self.alarm.now().into_u32());
+                    }
                     // Invalid state => don't care
                     _ => (),
                 }
@@ -635,35 +712,60 @@ where
         self.sending_app.map(|processid| {
             let _ = self.app.enter(processid, |app, kernel_data| {
                 match app.process_status {
-                    Some(BLEState::Advertising(RadioChannel::AdvertisingChannel37)) => {
-                        app.process_status =
-                            Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38));
-                        self.sending_app.set(processid);
-                        let _ = self.radio.set_tx_power(app.tx_power);
-                        let _ = app.send_advertisement(
-                            processid,
-                            kernel_data,
-                            self,
-                            RadioChannel::AdvertisingChannel38,
-                        );
-                    }
-
-                    Some(BLEState::Advertising(RadioChannel::AdvertisingChannel38)) => {
-                        app.process_status =
-                            Some(BLEState::Advertising(RadioChannel::AdvertisingChannel39));
-                        self.sending_app.set(processid);
-                        let _ = app.send_advertisement(
-                            processid,
-                            kernel_data,
-                            self,
-                            RadioChannel::AdvertisingChannel39,
-                        );
-                    }
-
-                    Some(BLEState::Advertising(RadioChannel::AdvertisingChannel39)) => {
-                        self.busy.set(false);
-                        app.process_status = Some(BLEState::AdvertisingIdle);
-                        app.set_next_alarm::<A::Frequency>(self.alarm.now().into_u32());
+                    Some(BLEState::Advertising(ch @ RadioChannel::AdvertisingChannel37))
+                    | Some(BLEState::Advertising(ch @ RadioChannel::AdvertisingChannel38))
+                    | Some(BLEState::Advertising(ch @ RadioChannel::AdvertisingChannel39)) => {
+                        if app.pdu_type == ADV_IND {
+                            // ADV_IND is connectable: listen for CONNECT_IND on the same
+                            // channel before moving on.  T_IFS gives the central 150 µs from
+                            // the end of our ADV_IND to start its CONNECT_IND; software RX
+                            // setup takes ~65 µs, well within that window.
+                            let now = self.alarm.now().into_u32();
+                            // 3 ms timeout — if no CONNECT_IND arrives, advance to next channel.
+                            let timeout_ticks = 3 * A::Frequency::frequency() / 1000;
+                            app.alarm_data.expiration = Expiration::Enabled(now, timeout_ticks);
+                            app.process_status = Some(BLEState::AdvertisingRx(ch));
+                            self.sending_app.take();
+                            self.receiving_app.set(processid);
+                            self.radio.receive_advertisement(ch);
+                        } else {
+                            // Non-connectable PDU: just cycle to the next TX channel.
+                            match ch {
+                                RadioChannel::AdvertisingChannel37 => {
+                                    app.process_status = Some(BLEState::Advertising(
+                                        RadioChannel::AdvertisingChannel38,
+                                    ));
+                                    self.sending_app.set(processid);
+                                    let _ = self.radio.set_tx_power(app.tx_power);
+                                    let _ = app.send_advertisement(
+                                        processid,
+                                        kernel_data,
+                                        self,
+                                        RadioChannel::AdvertisingChannel38,
+                                    );
+                                }
+                                RadioChannel::AdvertisingChannel38 => {
+                                    app.process_status = Some(BLEState::Advertising(
+                                        RadioChannel::AdvertisingChannel39,
+                                    ));
+                                    self.sending_app.set(processid);
+                                    let _ = app.send_advertisement(
+                                        processid,
+                                        kernel_data,
+                                        self,
+                                        RadioChannel::AdvertisingChannel39,
+                                    );
+                                }
+                                RadioChannel::AdvertisingChannel39 => {
+                                    self.busy.set(false);
+                                    app.process_status = Some(BLEState::AdvertisingIdle);
+                                    app.set_next_alarm::<A::Frequency>(
+                                        self.alarm.now().into_u32(),
+                                    );
+                                }
+                                _ => (),
+                            }
+                        }
                     }
                     // Invalid state => don't care
                     _ => (),

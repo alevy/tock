@@ -1119,6 +1119,10 @@ impl<'a> ble_advertising::BleAdvertisementDriver<'a> for Radio<'a> {
     fn set_transmit_client(&self, client: &'a dyn ble_advertising::TxClient) {
         self.tx_client.set(client);
     }
+
+    fn stop_receive(&self) {
+        self.radio_off();
+    }
 }
 
 impl ble_advertising::BleConfig for Radio<'_> {
