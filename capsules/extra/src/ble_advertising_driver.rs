@@ -142,7 +142,7 @@ const PACKET_ADDR_LEN: usize = 6;
 pub const PACKET_LENGTH: usize = 39;
 const ADV_HEADER_TXADD_OFFSET: usize = 6;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 enum BLEState {
     Idle,
     ScanningIdle,
@@ -325,6 +325,32 @@ impl App {
     }
 }
 
+// Build a minimal ADV_IND PDU for kernel-mode connectable advertising.
+// Address: random-static C0:FF:EE:BE:EF:42.  Returns total byte count.
+fn build_kernel_adv_pdu(buf: &mut [u8]) -> usize {
+    buf[0] = 0x40; // ADV_IND (0x00) | TxAdd=1 (random) = 0x40
+    buf[2] = 0x42;
+    buf[3] = 0xEF;
+    buf[4] = 0xBE;
+    buf[5] = 0xEE;
+    buf[6] = 0xFF;
+    buf[7] = 0xC0; // AdvA LE: C0:FF:EE:BE:EF:42
+    buf[8] = 0x02;
+    buf[9] = 0x01;
+    buf[10] = 0x06; // Flags AD
+    buf[11] = 0x08;
+    buf[12] = 0x09; // Complete Local Name "TockBLE"
+    buf[13] = b'T';
+    buf[14] = b'o';
+    buf[15] = b'c';
+    buf[16] = b'k';
+    buf[17] = b'B';
+    buf[18] = b'L';
+    buf[19] = b'E';
+    buf[1] = 18; // PDU len: AdvA (6) + AdvData (12) = 18
+    20
+}
+
 // Parse a CONNECT_IND PDU (BT Core Spec Vol 6 Part B §2.3.3.1).
 // buf must include the 2-byte PDU header (S0 + LENGTH) followed by the payload.
 fn parse_connect_ind(buf: &[u8]) -> Option<ConnectionParams> {
@@ -379,6 +405,9 @@ where
     // scanning are parsed and handed off to the connection manager.
     conn_driver: OptionalCell<&'a dyn ble_advertising::BleConnectionDriver<'a>>,
     setup_client: OptionalCell<&'a dyn ConnectionSetupClient>,
+    // Kernel-mode connectable advertising state (no process required).
+    kernel_adv_state: Cell<Option<BLEState>>,
+    kernel_adv_expiration: Cell<Expiration>,
 }
 
 impl<'a, B, A> BLE<'a, B, A>
@@ -407,6 +436,8 @@ where
             receiving_app: OptionalCell::empty(),
             conn_driver: OptionalCell::empty(),
             setup_client: OptionalCell::empty(),
+            kernel_adv_state: Cell::new(None),
+            kernel_adv_expiration: Cell::new(Expiration::Disabled),
         }
     }
 
@@ -417,6 +448,25 @@ where
     ) {
         self.conn_driver.set(driver);
         self.setup_client.set(client);
+    }
+
+    /// Start connectable advertising from kernel code (no userspace process required).
+    ///
+    /// Sends ADV_IND on channels 37/38/39 in round-robin and accepts the first
+    /// CONNECT_IND.  Has no effect if the radio is already busy.
+    pub fn start_connectable_advertising(&self) {
+        if self.busy.get() {
+            return;
+        }
+        self.busy.set(true);
+        self.kernel_adv_state
+            .set(Some(BLEState::Advertising(RadioChannel::AdvertisingChannel37)));
+        self.kernel_adv_expiration.set(Expiration::Disabled);
+        self.kernel_tx.take().map(|buf| {
+            let len = build_kernel_adv_pdu(buf);
+            self.radio
+                .transmit_advertisement(buf, len, RadioChannel::AdvertisingChannel37);
+        });
     }
 
     // Determines which app timer will expire next and sets the underlying alarm
@@ -431,6 +481,18 @@ where
         let mut next_ref = u32::MAX;
         let mut next_dt = u32::MAX;
         let mut next_dist = u32::MAX;
+
+        // Include kernel advertising timer.
+        if let Expiration::Enabled(reference, dt) = self.kernel_adv_expiration.get() {
+            let exp = reference.wrapping_add(dt);
+            let t_dist = exp.wrapping_sub(now.into_u32());
+            if next_dist > t_dist {
+                next_ref = reference;
+                next_dt = dt;
+                next_dist = t_dist;
+            }
+        }
+
         for app in self.app.iter() {
             app.enter(|app, _| match app.alarm_data.expiration {
                 Expiration::Enabled(reference, dt) => {
@@ -472,6 +534,70 @@ where
     // recently performed an operation.
     fn alarm(&self) {
         let now = self.alarm.now();
+
+        // Kernel-mode advertising timers (3 ms RX window + inter-event delay).
+        if let Expiration::Enabled(reference, dt) = self.kernel_adv_expiration.get() {
+            let exp = A::Ticks::from(reference.wrapping_add(dt));
+            let t0 = A::Ticks::from(reference);
+            if !now.within_range(t0, exp) {
+                self.kernel_adv_expiration.set(Expiration::Disabled);
+                match self.kernel_adv_state.get() {
+                    // 3 ms RX window expired without a CONNECT_IND: advance channel.
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
+                        self.radio.stop_receive();
+                        self.kernel_adv_state.set(Some(BLEState::Advertising(
+                            RadioChannel::AdvertisingChannel38,
+                        )));
+                        self.kernel_tx.take().map(|buf| {
+                            let len = build_kernel_adv_pdu(buf);
+                            self.radio.transmit_advertisement(
+                                buf,
+                                len,
+                                RadioChannel::AdvertisingChannel38,
+                            );
+                        });
+                    }
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
+                        self.radio.stop_receive();
+                        self.kernel_adv_state.set(Some(BLEState::Advertising(
+                            RadioChannel::AdvertisingChannel39,
+                        )));
+                        self.kernel_tx.take().map(|buf| {
+                            let len = build_kernel_adv_pdu(buf);
+                            self.radio.transmit_advertisement(
+                                buf,
+                                len,
+                                RadioChannel::AdvertisingChannel39,
+                            );
+                        });
+                    }
+                    Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel39)) => {
+                        // All 3 channels done: pause before next cycle.
+                        self.radio.stop_receive();
+                        let now_u32 = self.alarm.now().into_u32();
+                        let delay = 50 * A::Frequency::frequency() / 1000;
+                        self.kernel_adv_expiration
+                            .set(Expiration::Enabled(now_u32, delay));
+                        self.kernel_adv_state.set(Some(BLEState::AdvertisingIdle));
+                    }
+                    // Inter-event delay expired: start next advertising cycle.
+                    Some(BLEState::AdvertisingIdle) => {
+                        self.kernel_adv_state.set(Some(BLEState::Advertising(
+                            RadioChannel::AdvertisingChannel37,
+                        )));
+                        self.kernel_tx.take().map(|buf| {
+                            let len = build_kernel_adv_pdu(buf);
+                            self.radio.transmit_advertisement(
+                                buf,
+                                len,
+                                RadioChannel::AdvertisingChannel37,
+                            );
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         self.app.each(|processid, app, kernel_data| {
             if let Expiration::Enabled(reference, dt) = app.alarm_data.expiration {
@@ -581,6 +707,8 @@ where
                     });
                 });
                 // Stop advertising/scanning; the connection manager takes over.
+                self.kernel_adv_state.set(None);
+                self.kernel_adv_expiration.set(Expiration::Disabled);
                 self.receiving_app.map(|processid| {
                     let _ = self.app.enter(processid, |app, _| {
                         app.process_status = Some(BLEState::Idle);
@@ -590,6 +718,53 @@ where
                 self.receiving_app.take();
                 self.busy.set(false);
                 return;
+            }
+        }
+
+        // Non-CONNECT_IND during kernel-mode advertising: advance to next channel.
+        if self.receiving_app.is_none() {
+            match self.kernel_adv_state.get() {
+                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
+                    self.kernel_adv_expiration.set(Expiration::Disabled);
+                    self.kernel_adv_state.set(Some(BLEState::Advertising(
+                        RadioChannel::AdvertisingChannel38,
+                    )));
+                    self.kernel_tx.take().map(|buf| {
+                        let len = build_kernel_adv_pdu(buf);
+                        self.radio.transmit_advertisement(
+                            buf,
+                            len,
+                            RadioChannel::AdvertisingChannel38,
+                        );
+                    });
+                    return;
+                }
+                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
+                    self.kernel_adv_expiration.set(Expiration::Disabled);
+                    self.kernel_adv_state.set(Some(BLEState::Advertising(
+                        RadioChannel::AdvertisingChannel39,
+                    )));
+                    self.kernel_tx.take().map(|buf| {
+                        let len = build_kernel_adv_pdu(buf);
+                        self.radio.transmit_advertisement(
+                            buf,
+                            len,
+                            RadioChannel::AdvertisingChannel39,
+                        );
+                    });
+                    return;
+                }
+                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel39)) => {
+                    self.kernel_adv_expiration.set(Expiration::Disabled);
+                    let now_u32 = self.alarm.now().into_u32();
+                    let delay = 50 * A::Frequency::frequency() / 1000;
+                    self.kernel_adv_expiration
+                        .set(Expiration::Enabled(now_u32, delay));
+                    self.kernel_adv_state.set(Some(BLEState::AdvertisingIdle));
+                    self.reset_active_alarm();
+                    return;
+                }
+                _ => {}
             }
         }
 
@@ -702,6 +877,21 @@ where
     // re-transmissions for invalid CRCs
     fn transmit_event(&self, buf: &'static mut [u8], _crc_ok: Result<(), ErrorCode>) {
         self.kernel_tx.replace(buf);
+
+        // Kernel-mode advertising path: after ADV_IND TX, listen for CONNECT_IND.
+        if self.sending_app.is_none() {
+            if let Some(BLEState::Advertising(ch)) = self.kernel_adv_state.get() {
+                let now = self.alarm.now().into_u32();
+                let timeout_ticks = 3 * A::Frequency::frequency() / 1000;
+                self.kernel_adv_expiration
+                    .set(Expiration::Enabled(now, timeout_ticks));
+                self.kernel_adv_state.set(Some(BLEState::AdvertisingRx(ch)));
+                self.radio.receive_advertisement(ch);
+                self.reset_active_alarm();
+                return;
+            }
+        }
+
         self.sending_app.map(|processid| {
             let _ = self.app.enter(processid, |app, kernel_data| {
                 match app.process_status {
