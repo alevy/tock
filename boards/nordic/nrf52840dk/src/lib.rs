@@ -70,7 +70,7 @@
 #![no_std]
 #![deny(missing_docs)]
 
-use capsules_core::virtualizers::virtual_alarm::MuxAlarm;
+use capsules_core::virtualizers::virtual_alarm::{MuxAlarm, VirtualMuxAlarm};
 use capsules_extra::net::ieee802154::MacAddress;
 use capsules_extra::net::ipv6::ip_utils::IPAddr;
 use kernel::component::Component;
@@ -128,6 +128,8 @@ const DEFAULT_CTX_PREFIX: [u8; 16] = [0x0_u8; 16]; //Context for 6LoWPAN Compres
 
 /// Debug Writer
 pub mod io;
+
+mod ble_test_advertiser;
 
 /// Whether to use UART debugging or Segger RTT (USB) debugging.
 ///
@@ -658,6 +660,55 @@ pub unsafe fn start_no_pconsole() -> (
         mux_alarm,
     )
     .finalize(components::ble_component_static!(AlarmHw, BleHw));
+
+    // ConnectionManager: drives connection events after CONNECT_IND is received.
+    let conn_rx_buf = static_init!([u8; 64], [0u8; 64]);
+    let conn_tx_buf = static_init!([u8; 64], [0u8; 64]);
+    let conn_alarm = static_init!(
+        VirtualMuxAlarm<'static, AlarmHw>,
+        VirtualMuxAlarm::new(mux_alarm)
+    );
+    conn_alarm.setup();
+    let conn_manager = static_init!(
+        capsules_extra::ble_ll_connection::ConnectionManager<
+            'static,
+            BleHw,
+            VirtualMuxAlarm<'static, AlarmHw>,
+        >,
+        capsules_extra::ble_ll_connection::ConnectionManager::new(
+            &base_peripherals.ble_radio,
+            conn_alarm,
+            conn_rx_buf,
+            conn_tx_buf,
+        )
+    );
+    kernel::hil::time::Alarm::set_alarm_client(conn_alarm, conn_manager);
+    conn_manager.set_driver_client();
+
+    // BLE test advertiser: advertise on boot and accept the first CONNECT_IND.
+    // This overrides the userspace BLE advertising driver's TX/RX clients,
+    // making the device connectable without a userspace app.
+    let ble_adv_buf = static_init!([u8; 64], [0u8; 64]);
+    let ble_adv_alarm = static_init!(
+        VirtualMuxAlarm<'static, AlarmHw>,
+        VirtualMuxAlarm::new(mux_alarm)
+    );
+    ble_adv_alarm.setup();
+    let test_adv = static_init!(
+        ble_test_advertiser::BleTestAdvertiser<
+            'static,
+            BleHw,
+            VirtualMuxAlarm<'static, AlarmHw>,
+        >,
+        ble_test_advertiser::BleTestAdvertiser::new(
+            &base_peripherals.ble_radio,
+            ble_adv_alarm,
+            ble_adv_buf,
+        )
+    );
+    kernel::hil::time::Alarm::set_alarm_client(ble_adv_alarm, test_adv);
+    test_adv.set_connection_setup_client(conn_manager);
+    test_adv.start();
 
     //--------------------------------------------------------------------------
     // TEMPERATURE (internal)
