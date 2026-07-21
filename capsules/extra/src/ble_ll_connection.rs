@@ -37,6 +37,10 @@ const MIN_WIDENING_US: u32 = 16;
 const WINDOW_GUARD_US: u32 = 150;
 // How many TIMER0 ticks (µs) before expected anchor to arm PPI CH21.
 const TIMER_SETUP_TICKS: u32 = 500;
+// transmitWindowDelay for legacy (LE 1M primary advertising channel) connections
+// (BT Core Spec Vol 6 Part B §4.5.3, Table 4.3): the first connection event's
+// transmit window opens this many µs after the end of the CONNECT_IND, plus WinOffset.
+const TRANSMIT_WINDOW_DELAY_US: u32 = 1250;
 
 /// One entry in the debug ring buffer — populated after each connection event.
 #[derive(Copy, Clone)]
@@ -76,6 +80,10 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     params: Cell<Option<ConnectionParams>>,
     event_counter: Cell<u32>,
     last_anchor_ticks: Cell<u32>,
+    /// Absolute TIMER0 tick (µs) at which the next RX window should open.
+    /// Computed once per event; read both when arming the coarse alarm and when
+    /// programming the hardware RX-open compare.
+    next_open_time: Cell<u32>,
     last_unmapped_channel: Cell<u8>,
     missed_events: Cell<u16>,
 
@@ -143,6 +151,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             params: Cell::new(None),
             event_counter: Cell::new(0),
             last_anchor_ticks: Cell::new(0),
+            next_open_time: Cell::new(0),
             last_unmapped_channel: Cell::new(0),
             missed_events: Cell::new(0),
             rx_buf: TakeCell::new(rx_buf),
@@ -167,21 +176,33 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         self.debug_log.get()
     }
 
-    fn schedule_next_event(&self, params: &ConnectionParams) {
+    // Compute the RX-window open time for the *next* connection event, relative to
+    // the last known-good anchor.  The event being scheduled is (missed_events + 1)
+    // intervals after that anchor, so both the interval offset and the window
+    // widening scale with that count.  Used for every event after the first.
+    fn compute_next_open_time(&self, params: &ConnectionParams) {
+        let n = self.missed_events.get() as u32 + 1;
         let interval_us = params.conn_interval_us;
-        let widening = window_widening(self.missed_events.get() as u32 + 1, interval_us);
-        let open_time = self
+        let widening = window_widening(n, interval_us);
+        let expected_anchor = self
             .last_anchor_ticks
             .get()
-            .wrapping_add(interval_us)
-            .wrapping_sub(widening + WINDOW_GUARD_US);
+            .wrapping_add(interval_us.wrapping_mul(n));
+        self.next_open_time
+            .set(expected_anchor.wrapping_sub(widening + WINDOW_GUARD_US));
+    }
 
-        // Arm the alarm so the CPU wakes up TIMER_SETUP_TICKS before open_time.
-        // TIMER0 runs at 1 MHz (1 µs/tick); compute how many µs remain and
-        // convert to the alarm's native tick frequency.
-        let wakeup_us = open_time.wrapping_sub(TIMER_SETUP_TICKS);
+    // Arm the coarse alarm so the CPU wakes up TIMER_SETUP_TICKS (µs) before the
+    // absolute `next_open_time`.  The precise RX-window open is done in hardware via
+    // TIMER0 CC[0]; this alarm only guarantees the CPU is awake to program it.
+    // TIMER0 runs at 1 MHz (1 µs/tick); compute how many µs remain and convert to
+    // the alarm's native tick frequency.
+    fn schedule_next_event(&self, params: &ConnectionParams) {
+        let wakeup_us = self.next_open_time.get().wrapping_sub(TIMER_SETUP_TICKS);
         let now_us = self.driver.get_timer0_now();
-        let delta_us = wakeup_us.wrapping_sub(now_us).min(interval_us * 2);
+        let delta_us = wakeup_us
+            .wrapping_sub(now_us)
+            .min(params.conn_interval_us.saturating_mul(2));
         let dt = self.alarm.ticks_from_us(delta_us);
         self.alarm.set_alarm(self.alarm.now(), dt);
     }
@@ -220,12 +241,29 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionSetupClient
         self.missed_events.set(0);
         self.last_unmapped_channel.set(0);
 
-        // Compute the anchor for the first connection event:
-        //   anchor ≈ timer0_now + winOffset + winSize/2
-        let first_anchor = timer0_now
-            .wrapping_add(params.win_offset_us)
-            .wrapping_add(params.win_size_us / 2);
-        self.last_anchor_ticks.set(first_anchor);
+        // First connection event (BT Core Spec Vol 6 Part B §4.5.3):
+        //   transmitWindowStart = end_of_CONNECT_IND + transmitWindowDelay + WinOffset
+        // and the master transmits somewhere within a WinSize-wide window from there.
+        // timer0_now was captured right after CONNECT_IND, so it approximates the end
+        // of that packet.
+        let win_start = timer0_now
+            .wrapping_add(TRANSMIT_WINDOW_DELAY_US)
+            .wrapping_add(params.win_offset_us);
+
+        // Open the RX window a guard interval before the window start; the radio's
+        // 2 ms hardware window-timeout covers the full WinSize uncertainty (so we do
+        // NOT go through compute_next_open_time, which assumes a point anchor).
+        self.next_open_time
+            .set(win_start.wrapping_sub(WINDOW_GUARD_US));
+
+        // Provisional anchor reference: treat the window centre as anchor[0], and
+        // seed last_anchor_ticks as if a successful event occurred one interval
+        // earlier.  This makes compute_next_open_time correct even if the first
+        // event is missed (it will target win_centre + interval next), and it is
+        // overwritten by the real captured anchor as soon as an event succeeds.
+        let win_centre = win_start.wrapping_add(params.win_size_us / 2);
+        self.last_anchor_ticks
+            .set(win_centre.wrapping_sub(params.conn_interval_us));
 
         // Prepare a TX buffer for the first event.
         self.tx_buf.map(write_empty_ack);
@@ -243,15 +281,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> AlarmClient for ConnectionMan
             None => return,
         };
 
-        let interval_us = params.conn_interval_us;
-        let widening = window_widening(self.missed_events.get() as u32 + 1, interval_us);
-
-        // RX window opens at last_anchor + connInterval - widening - guard
-        let open_time = self
-            .last_anchor_ticks
-            .get()
-            .wrapping_add(interval_us)
-            .wrapping_sub(widening + WINDOW_GUARD_US);
+        // The absolute open time was computed when this event was scheduled
+        // (connect_ind_received for the first event, compute_next_open_time after).
+        let open_time = self.next_open_time.get();
 
         // Pick channel for this event.
         let (channel_num, new_unmapped) = if self.single_channel_test.get() {
@@ -322,7 +354,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         self.tx_buf.replace(tx_buf);
         self.rx_buf.replace(buf);
 
-        // Schedule next connection event.
+        // Compute the next event's open time from the (possibly just-corrected)
+        // anchor, then arm the coarse alarm for it.
+        self.compute_next_open_time(&params);
         self.schedule_next_event(&params);
     }
 }
