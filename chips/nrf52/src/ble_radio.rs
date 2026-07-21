@@ -629,6 +629,10 @@ pub struct Radio<'a> {
     conn_rx_ok: Cell<bool>,
     conn_anchor_ticks: Cell<u32>,
     conn_params: Cell<Option<ConnectionParams>>,
+    // Link-layer acknowledgement state (BT Core Spec Vol 6 Part B §4.5.9):
+    // our transmit sequence number and next-expected sequence number, each 1 bit.
+    conn_sn: Cell<u8>,
+    conn_nesn: Cell<u8>,
 }
 
 impl<'a> Radio<'a> {
@@ -645,6 +649,8 @@ impl<'a> Radio<'a> {
             conn_rx_ok: Cell::new(false),
             conn_anchor_ticks: Cell::new(0),
             conn_params: Cell::new(None),
+            conn_sn: Cell::new(0),
+            conn_nesn: Cell::new(0),
         }
     }
 
@@ -721,9 +727,39 @@ impl<'a> Radio<'a> {
                 match self.conn_phase.get() {
                     ConnPhase::Rx => {
                         // RX done, DISABLED_TXEN shortcut has already started TX
-                        // ramp-up.  We have ~40 µs before READY fires to swap
-                        // PACKETPTR to the pre-loaded TX PDU buffer.
-                        if let Some(ptr) = self.conn_tx_buf.map(|b| b.as_ptr() as u32) {
+                        // ramp-up.  We have ~40 µs before READY fires to update the
+                        // pre-loaded TX PDU and swap PACKETPTR to it.
+
+                        // Link-layer acknowledgement / flow control
+                        // (BT Core Spec Vol 6 Part B §4.5.9).  Only act on a
+                        // good-CRC reception; a corrupt or absent packet must not
+                        // advance our sequence numbers.  The received header was
+                        // DMA'd into PAYLOAD before the RX END event.
+                        if self.conn_rx_ok.get() {
+                            let rx_hdr = unsafe { (*addr_of!(PAYLOAD))[0] };
+                            let rx_nesn = (rx_hdr >> 2) & 1; // acks our transmitted SN
+                            let rx_sn = (rx_hdr >> 3) & 1; // master's sequence number
+                            // Master acknowledged our last PDU iff its NESN moved
+                            // past our SN; advance (flip) our SN so we send new data.
+                            if rx_nesn != self.conn_sn.get() {
+                                self.conn_sn.set(rx_nesn);
+                            }
+                            // A new (non-retransmitted) PDU has SN == the value we
+                            // expect next; flip NESN to acknowledge it.
+                            if rx_sn == self.conn_nesn.get() {
+                                self.conn_nesn.set(self.conn_nesn.get() ^ 1);
+                            }
+                        }
+                        // Stamp the current SN/NESN into the pre-loaded TX PDU
+                        // header (bit 2 = NESN, bit 3 = SN) and point the radio at
+                        // it.  This happens before the TX ramp completes, so the
+                        // ACK bits the master sees reflect the packet just received.
+                        let sn = self.conn_sn.get();
+                        let nesn = self.conn_nesn.get();
+                        if let Some(ptr) = self.conn_tx_buf.map(|b| {
+                            b[0] = (b[0] & !0b0000_1100) | (nesn << 2) | (sn << 3);
+                            b.as_ptr() as u32
+                        }) {
                             self.registers.packetptr.set(ptr);
                         }
                         // Remove DISABLED_TXEN so the post-TX DISABLED doesn't
@@ -983,6 +1019,9 @@ impl<'a> Radio<'a> {
 
     fn connection_configure_impl(&self, params: &ConnectionParams) {
         self.conn_params.set(Some(*params));
+        // Reset link-layer sequence numbers for the new connection.
+        self.conn_sn.set(0);
+        self.conn_nesn.set(0);
         self.timer0_init();
         // PPI CH0 (programmable): TIMER0_EVENTS_COMPARE[2] → RADIO_TASKS_DISABLE
         unsafe {
