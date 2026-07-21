@@ -57,6 +57,8 @@ pub struct DebugEntry {
     /// First payload byte (`buf[2]`): the control opcode when this is a control PDU.
     /// Only meaningful when `rx_ok` is true; otherwise reflects stale/corrupt bytes.
     pub opcode: u8,
+    /// Whether the master acknowledged the PDU we transmitted in the previous event.
+    pub tx_acked: bool,
 }
 
 impl DebugEntry {
@@ -69,6 +71,7 @@ impl DebugEntry {
             header: 0,
             len: 0,
             opcode: 0,
+            tx_acked: false,
         }
     }
 }
@@ -95,6 +98,10 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     /// Computed once per event; read both when arming the coarse alarm and when
     /// programming the hardware RX-open compare.
     next_open_time: Cell<u32>,
+    /// Whether the PDU we last transmitted has been acknowledged by the master.
+    /// Foundation for stop-and-wait flow control: a content-bearing PDU must be
+    /// held (retransmitted) until this becomes true before the next is loaded.
+    tx_acked: Cell<bool>,
     last_unmapped_channel: Cell<u8>,
     missed_events: Cell<u16>,
 
@@ -182,6 +189,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             event_counter: Cell::new(0),
             last_anchor_ticks: Cell::new(0),
             next_open_time: Cell::new(0),
+            tx_acked: Cell::new(false),
             last_unmapped_channel: Cell::new(0),
             missed_events: Cell::new(0),
             rx_buf: TakeCell::new(rx_buf),
@@ -246,7 +254,17 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         self.disconnect_client.map(|c| c.connection_lost());
     }
 
-    fn log_event(&self, channel: u8, rx_ok: bool, anchor: u32, header: u8, len: u8, opcode: u8) {
+    #[allow(clippy::too_many_arguments)]
+    fn log_event(
+        &self,
+        channel: u8,
+        rx_ok: bool,
+        anchor: u32,
+        header: u8,
+        len: u8,
+        opcode: u8,
+        tx_acked: bool,
+    ) {
         let head = self.debug_log_head.get();
         let entry = DebugEntry {
             channel,
@@ -256,6 +274,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             header,
             len,
             opcode,
+            tx_acked,
         };
         let mut log = self.debug_log.get();
         log[head % 16] = entry;
@@ -276,8 +295,8 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
                 continue;
             }
             debug!(
-                "  evt {} ch {} rx_ok {} hdr {:#04x} len {} op {:#04x}",
-                e.event_counter, e.channel, e.rx_ok, e.header, e.len, e.opcode
+                "  evt {} ch {} rx_ok {} hdr {:#04x} len {} op {:#04x} tx_acked {}",
+                e.event_counter, e.channel, e.rx_ok, e.header, e.len, e.opcode, e.tx_acked
             );
         }
     }
@@ -371,7 +390,12 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         tx_buf: &'static mut [u8],
         result: Result<(), ErrorCode>,
         anchor_ticks: u32,
+        tx_acked: bool,
     ) {
+        // Record acknowledgement of our last transmitted PDU (stop-and-wait flow
+        // control foundation; not yet acted on while we only send empty PDUs).
+        self.tx_acked.set(tx_acked);
+
         let params = match self.params.get() {
             Some(p) => p,
             None => {
@@ -390,7 +414,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         } else {
             (0, 0, 0)
         };
-        self.log_event(channel, rx_ok, anchor_ticks, header, len, opcode);
+        self.log_event(channel, rx_ok, anchor_ticks, header, len, opcode, tx_acked);
 
         // A master-initiated disconnect arrives as an LL_TERMINATE_IND control PDU.
         // Our empty-PDU ACK for this event has already been sent by the hardware

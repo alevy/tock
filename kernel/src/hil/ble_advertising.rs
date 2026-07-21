@@ -143,12 +143,18 @@ pub trait ConnectionEventClient {
     /// * `result` — `Ok(())` if the master's PDU had a valid CRC, `Err(FAIL)` otherwise.
     /// * `anchor_ticks` — TIMER0 tick captured by hardware when the master's access
     ///   address was detected (PPI CH26).  Zero if the master was not heard.
+    /// * `tx_acked` — `true` if the master acknowledged the PDU we transmitted in the
+    ///   previous connection event (its NESN advanced past our SN), per the link-layer
+    ///   sequence-number scheme (BT Core Spec Vol 6 Part B §4.5.9).  Used for
+    ///   stop-and-wait flow control: the client may load the next payload only once
+    ///   the outstanding one is acknowledged.
     fn connection_event_done(
         &self,
         buf: &'static mut [u8],
         tx_buf: &'static mut [u8],
         result: Result<(), ErrorCode>,
         anchor_ticks: u32,
+        tx_acked: bool,
     );
 }
 

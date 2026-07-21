@@ -633,6 +633,10 @@ pub struct Radio<'a> {
     // our transmit sequence number and next-expected sequence number, each 1 bit.
     conn_sn: Cell<u8>,
     conn_nesn: Cell<u8>,
+    // Set during an event when the master acknowledged the PDU we transmitted in
+    // the previous event (its NESN advanced past our SN).  Reported to the client
+    // for stop-and-wait flow control; reset at the start of each event.
+    conn_tx_acked: Cell<bool>,
 }
 
 impl<'a> Radio<'a> {
@@ -651,6 +655,7 @@ impl<'a> Radio<'a> {
             conn_params: Cell::new(None),
             conn_sn: Cell::new(0),
             conn_nesn: Cell::new(0),
+            conn_tx_acked: Cell::new(false),
         }
     }
 
@@ -743,6 +748,7 @@ impl<'a> Radio<'a> {
                             // past our SN; advance (flip) our SN so we send new data.
                             if rx_nesn != self.conn_sn.get() {
                                 self.conn_sn.set(rx_nesn);
+                                self.conn_tx_acked.set(true);
                             }
                             // A new (non-retransmitted) PDU has SN == the value we
                             // expect next; flip NESN to acknowledge it.
@@ -798,6 +804,7 @@ impl<'a> Radio<'a> {
                                     self.conn_tx_buf.take().unwrap(),
                                     result,
                                     anchor,
+                                    self.conn_tx_acked.get(),
                                 )
                             });
                         }
@@ -1022,6 +1029,7 @@ impl<'a> Radio<'a> {
         // Reset link-layer sequence numbers for the new connection.
         self.conn_sn.set(0);
         self.conn_nesn.set(0);
+        self.conn_tx_acked.set(false);
         self.timer0_init();
         // PPI CH0 (programmable): TIMER0_EVENTS_COMPARE[2] → RADIO_TASKS_DISABLE
         unsafe {
@@ -1046,6 +1054,7 @@ impl<'a> Radio<'a> {
 
         self.conn_tx_buf.replace(tx_buf);
         self.conn_rx_ok.set(false);
+        self.conn_tx_acked.set(false);
 
         // Power-cycle resets all radio registers; reconfigure fully each event.
         self.radio_on();
