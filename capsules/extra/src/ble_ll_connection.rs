@@ -129,6 +129,25 @@ fn window_widening(events_since_anchor: u32, conn_interval_us: u32) -> u32 {
     drift.max(MIN_WIDENING_US)
 }
 
+// Data channel PDU header (BT Core Spec Vol 6 Part B §2.4): the low two bits of
+// the first header byte are the LLID.
+const LLID_MASK: u8 = 0b11;
+// LLID = 0b11 marks an LL Control PDU.
+const LLID_CONTROL: u8 = 0b11;
+// LL Control PDU opcodes (BT Core Spec Vol 6 Part B §2.4.2).
+const LL_TERMINATE_IND: u8 = 0x02;
+
+// True if `buf` is an LL Control PDU carrying LL_TERMINATE_IND.
+//
+// `buf` layout: [0] = header (LLID in the low two bits), [1] = payload length,
+// [2..] = payload whose first byte is the control opcode.
+fn is_ll_terminate_ind(buf: &[u8]) -> bool {
+    buf.len() >= 3
+        && (buf[0] & LLID_MASK) == LLID_CONTROL
+        && buf[1] >= 1
+        && buf[2] == LL_TERMINATE_IND
+}
+
 // Prepare a LL_DATA empty ACK PDU in-place (LLID=0x01, NESN/SN/MD=0, len=0).
 fn write_empty_ack(buf: &mut [u8]) {
     if buf.len() >= 2 {
@@ -331,6 +350,17 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         let rx_ok = result.is_ok();
         let channel = self.last_unmapped_channel.get(); // approximate for debug log
         self.log_event(channel, rx_ok, anchor_ticks);
+
+        // A master-initiated disconnect arrives as an LL_TERMINATE_IND control PDU.
+        // Our empty-PDU ACK for this event has already been sent by the hardware
+        // (RX→TX turnaround), which is the acknowledgement the master waits for, so
+        // we can tear the connection down now and resume advertising.
+        if rx_ok && is_ll_terminate_ind(buf) {
+            self.rx_buf.replace(buf);
+            self.tx_buf.replace(tx_buf);
+            self.declare_connection_lost();
+            return;
+        }
 
         if rx_ok {
             self.last_anchor_ticks.set(anchor_ticks);

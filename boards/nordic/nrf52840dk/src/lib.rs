@@ -687,6 +687,9 @@ pub unsafe fn start_no_pconsole() -> (
     // Wire the connection manager into the BLE advertising driver and start
     // connectable advertising on boot.  No userspace app is required.
     ble_radio.set_connection_driver(&base_peripherals.ble_radio, conn_manager);
+    // When a connection ends, the manager tells the advertising driver to resume
+    // advertising so the device can be rediscovered without a reset.
+    conn_manager.set_disconnect_client(ble_radio);
     ble_radio.start_connectable_advertising();
 
     //--------------------------------------------------------------------------
