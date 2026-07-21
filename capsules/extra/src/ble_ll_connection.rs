@@ -184,6 +184,10 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     resp_queue: Cell<[RespEntry; RESP_QUEUE_LEN]>,
     resp_head: Cell<usize>,
     resp_count: Cell<usize>,
+
+    // Value of the single read/write GATT characteristic (handle H_CHAR_VALUE).
+    char_value: Cell<[u8; CHAR_VALUE_MAX]>,
+    char_value_len: Cell<usize>,
     last_unmapped_channel: Cell<u8>,
     missed_events: Cell<u16>,
 
@@ -263,10 +267,42 @@ const DATA_PDU_HEADER: u8 = 0b10;
 // is to complete the client's transactions so the connection is not torn down.
 const L2CAP_CID_ATT: u16 = 0x0004;
 const ATT_MTU_DEFAULT: u16 = 23; // default LE ATT MTU; keeps ATT PDUs unfragmented
+
+// ATT opcodes (BT Core Spec Vol 3 Part F §3.4).
 const ATT_ERROR_RSP: u8 = 0x01;
 const ATT_EXCHANGE_MTU_REQ: u8 = 0x02;
 const ATT_EXCHANGE_MTU_RSP: u8 = 0x03;
+const ATT_READ_BY_TYPE_REQ: u8 = 0x08;
+const ATT_READ_BY_TYPE_RSP: u8 = 0x09;
+const ATT_READ_REQ: u8 = 0x0A;
+const ATT_READ_RSP: u8 = 0x0B;
+const ATT_READ_BY_GROUP_TYPE_REQ: u8 = 0x10;
+const ATT_READ_BY_GROUP_TYPE_RSP: u8 = 0x11;
+const ATT_WRITE_REQ: u8 = 0x12;
+const ATT_WRITE_RSP: u8 = 0x13;
+
+// ATT error codes.
+const ATT_ERR_INVALID_HANDLE: u8 = 0x01;
+const ATT_ERR_WRITE_NOT_PERMITTED: u8 = 0x03;
 const ATT_ERR_ATTR_NOT_FOUND: u8 = 0x0A;
+
+// GATT attribute-type UUIDs (BT Core Spec Vol 3 Part G).
+const GATT_PRIMARY_SERVICE: u16 = 0x2800;
+const GATT_CHARACTERISTIC: u16 = 0x2803;
+
+// A single vendor service (0xFFF0) with one read/write characteristic (0xFFF1).
+// Fixed handle layout: 0x0001 service decl, 0x0002 characteristic decl, 0x0003
+// characteristic value.
+const SVC_UUID: u16 = 0xFFF0;
+const CHR_UUID: u16 = 0xFFF1;
+const CHR_PROPS: u8 = 0x02 | 0x08; // Read | Write (with response)
+const H_SERVICE: u16 = 0x0001;
+const H_CHAR_DECL: u16 = 0x0002;
+const H_CHAR_VALUE: u16 = 0x0003;
+
+// Storage for the writable characteristic value.  Capped at MTU-3 so a read
+// response always fits the default 23-byte ATT MTU without fragmentation.
+const CHAR_VALUE_MAX: usize = 20;
 
 // True if `buf` is an LL Control PDU carrying LL_TERMINATE_IND.
 //
@@ -306,6 +342,20 @@ fn write_att_response(tx: &mut [u8], att: &[u8]) -> bool {
     true
 }
 
+// Write an ATT_ERROR_RSP for `req_op`/`handle` with error code `err` into `tx`.
+fn write_att_error(tx: &mut [u8], req_op: u8, handle: u16, err: u8) -> bool {
+    write_att_response(
+        tx,
+        &[
+            ATT_ERROR_RSP,
+            req_op,
+            (handle & 0xff) as u8,
+            (handle >> 8) as u8,
+            err,
+        ],
+    )
+}
+
 impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
     pub fn new(
         driver: &'a D,
@@ -327,6 +377,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             resp_queue: Cell::new([RespEntry::zero(); RESP_QUEUE_LEN]),
             resp_head: Cell::new(0),
             resp_count: Cell::new(0),
+            // Default characteristic value: recognisable "DE AD BE EF".
+            char_value: Cell::new([0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            char_value_len: Cell::new(4),
             last_unmapped_channel: Cell::new(0),
             missed_events: Cell::new(0),
             rx_buf: TakeCell::new(rx_buf),
@@ -430,11 +483,10 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         }
     }
 
-    // Respond to an ATT request on the L2CAP ATT channel.  We are a minimal server
-    // with no attributes: complete the MTU exchange and reject everything else with
-    // an error so the client's transactions finish instead of timing out.
+    // Handle an ATT request on the L2CAP ATT channel for our minimal GATT server:
+    // one vendor service (0xFFF0) with one read/write characteristic (0xFFF1).
     //
-    // `rx` data PDU layout: [2..4] = L2CAP length, [4..6] = CID, [6..] = payload.
+    // `rx` data PDU layout: [2..4] = L2CAP length, [4..6] = CID, [6..] = ATT PDU.
     fn build_att_response(&self, rx: &[u8], tx: &mut [u8]) -> bool {
         if rx.len() < 7 {
             return false;
@@ -443,31 +495,144 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         if cid != L2CAP_CID_ATT {
             return false; // not ATT (e.g. LE signalling channel); ignore for now
         }
-        let att_op = rx[6];
-        match att_op {
-            ATT_EXCHANGE_MTU_REQ => {
-                // Keep the default 23-byte MTU (small buffers, no fragmentation).
-                write_att_response(
-                    tx,
-                    &[
-                        ATT_EXCHANGE_MTU_RSP,
-                        (ATT_MTU_DEFAULT & 0xff) as u8,
-                        (ATT_MTU_DEFAULT >> 8) as u8,
-                    ],
-                )
+        let att = &rx[6..];
+        match att[0] {
+            ATT_EXCHANGE_MTU_REQ => write_att_response(
+                tx,
+                &[
+                    ATT_EXCHANGE_MTU_RSP,
+                    (ATT_MTU_DEFAULT & 0xff) as u8,
+                    (ATT_MTU_DEFAULT >> 8) as u8,
+                ],
+            ),
+            ATT_READ_BY_GROUP_TYPE_REQ => self.att_read_by_group_type(att, tx),
+            ATT_READ_BY_TYPE_REQ => self.att_read_by_type(att, tx),
+            ATT_READ_REQ => self.att_read(att, tx),
+            ATT_WRITE_REQ => self.att_write(att, tx),
+            other => {
+                // Other ATT methods (e.g. Find Information for descriptor
+                // discovery): reply "Attribute Not Found" so the transaction
+                // completes.  We expose no descriptors.
+                let handle = att
+                    .get(1)
+                    .zip(att.get(2))
+                    .map_or(0, |(lo, hi)| u16::from_le_bytes([*lo, *hi]));
+                write_att_error(tx, other, handle, ATT_ERR_ATTR_NOT_FOUND)
             }
-            _ => {
-                // No attributes: reply ATT_ERROR_RSP echoing the request opcode and
-                // its starting handle, with "Attribute Not Found".  For GATT
-                // discovery this is the normal end-of-results signal, so the client
-                // finishes discovery (finding no services) and keeps the link up.
-                let h_lo = rx.get(7).copied().unwrap_or(0);
-                let h_hi = rx.get(8).copied().unwrap_or(0);
-                write_att_response(
-                    tx,
-                    &[ATT_ERROR_RSP, att_op, h_lo, h_hi, ATT_ERR_ATTR_NOT_FOUND],
-                )
+        }
+    }
+
+    // ATT_READ_BY_GROUP_TYPE_REQ: [op][start(2)][end(2)][group type(2)].
+    // Used for primary-service discovery (group type 0x2800).
+    fn att_read_by_group_type(&self, att: &[u8], tx: &mut [u8]) -> bool {
+        if att.len() < 7 {
+            return write_att_error(tx, ATT_READ_BY_GROUP_TYPE_REQ, 0, ATT_ERR_ATTR_NOT_FOUND);
+        }
+        let start = u16::from_le_bytes([att[1], att[2]]);
+        let end = u16::from_le_bytes([att[3], att[4]]);
+        let group_type = u16::from_le_bytes([att[5], att[6]]);
+        if group_type == GATT_PRIMARY_SERVICE && start <= H_SERVICE && H_SERVICE <= end {
+            // One element: handle range [H_SERVICE..H_CHAR_VALUE], value = SVC_UUID.
+            write_att_response(
+                tx,
+                &[
+                    ATT_READ_BY_GROUP_TYPE_RSP,
+                    6, // per-element length: handle(2) + end group(2) + UUID(2)
+                    (H_SERVICE & 0xff) as u8,
+                    (H_SERVICE >> 8) as u8,
+                    (H_CHAR_VALUE & 0xff) as u8,
+                    (H_CHAR_VALUE >> 8) as u8,
+                    (SVC_UUID & 0xff) as u8,
+                    (SVC_UUID >> 8) as u8,
+                ],
+            )
+        } else {
+            // No (more) services in range: ends the client's service discovery.
+            write_att_error(tx, ATT_READ_BY_GROUP_TYPE_REQ, start, ATT_ERR_ATTR_NOT_FOUND)
+        }
+    }
+
+    // ATT_READ_BY_TYPE_REQ: [op][start(2)][end(2)][type(2)].
+    // Used for characteristic discovery (type 0x2803).
+    fn att_read_by_type(&self, att: &[u8], tx: &mut [u8]) -> bool {
+        if att.len() < 7 {
+            return write_att_error(tx, ATT_READ_BY_TYPE_REQ, 0, ATT_ERR_ATTR_NOT_FOUND);
+        }
+        let start = u16::from_le_bytes([att[1], att[2]]);
+        let end = u16::from_le_bytes([att[3], att[4]]);
+        let ty = u16::from_le_bytes([att[5], att[6]]);
+        if ty == GATT_CHARACTERISTIC && start <= H_CHAR_DECL && H_CHAR_DECL <= end {
+            // One element: handle = H_CHAR_DECL, value = properties + value handle +
+            // characteristic UUID.
+            write_att_response(
+                tx,
+                &[
+                    ATT_READ_BY_TYPE_RSP,
+                    7, // per-element length: handle(2) + value(5)
+                    (H_CHAR_DECL & 0xff) as u8,
+                    (H_CHAR_DECL >> 8) as u8,
+                    CHR_PROPS,
+                    (H_CHAR_VALUE & 0xff) as u8,
+                    (H_CHAR_VALUE >> 8) as u8,
+                    (CHR_UUID & 0xff) as u8,
+                    (CHR_UUID >> 8) as u8,
+                ],
+            )
+        } else {
+            write_att_error(tx, ATT_READ_BY_TYPE_REQ, start, ATT_ERR_ATTR_NOT_FOUND)
+        }
+    }
+
+    // ATT_READ_REQ: [op][handle(2)].
+    fn att_read(&self, att: &[u8], tx: &mut [u8]) -> bool {
+        if att.len() < 3 {
+            return write_att_error(tx, ATT_READ_REQ, 0, ATT_ERR_INVALID_HANDLE);
+        }
+        let handle = u16::from_le_bytes([att[1], att[2]]);
+        match handle {
+            H_SERVICE => write_att_response(
+                tx,
+                &[ATT_READ_RSP, (SVC_UUID & 0xff) as u8, (SVC_UUID >> 8) as u8],
+            ),
+            H_CHAR_DECL => write_att_response(
+                tx,
+                &[
+                    ATT_READ_RSP,
+                    CHR_PROPS,
+                    (H_CHAR_VALUE & 0xff) as u8,
+                    (H_CHAR_VALUE >> 8) as u8,
+                    (CHR_UUID & 0xff) as u8,
+                    (CHR_UUID >> 8) as u8,
+                ],
+            ),
+            H_CHAR_VALUE => {
+                let value = self.char_value.get();
+                let n = self.char_value_len.get().min(value.len());
+                let mut pdu = [0u8; 1 + CHAR_VALUE_MAX];
+                pdu[0] = ATT_READ_RSP;
+                pdu[1..1 + n].copy_from_slice(&value[..n]);
+                write_att_response(tx, &pdu[..1 + n])
             }
+            _ => write_att_error(tx, ATT_READ_REQ, handle, ATT_ERR_INVALID_HANDLE),
+        }
+    }
+
+    // ATT_WRITE_REQ: [op][handle(2)][value...].
+    fn att_write(&self, att: &[u8], tx: &mut [u8]) -> bool {
+        if att.len() < 3 {
+            return write_att_error(tx, ATT_WRITE_REQ, 0, ATT_ERR_INVALID_HANDLE);
+        }
+        let handle = u16::from_le_bytes([att[1], att[2]]);
+        if handle == H_CHAR_VALUE {
+            let value = &att[3..];
+            let n = value.len().min(CHAR_VALUE_MAX);
+            let mut v = [0u8; CHAR_VALUE_MAX];
+            v[..n].copy_from_slice(&value[..n]);
+            self.char_value.set(v);
+            self.char_value_len.set(n);
+            write_att_response(tx, &[ATT_WRITE_RSP])
+        } else {
+            write_att_error(tx, ATT_WRITE_REQ, handle, ATT_ERR_WRITE_NOT_PERMITTED)
         }
     }
 
@@ -511,8 +676,22 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
                 true
             }
             LL_CONNECTION_UPDATE_IND | LL_CHANNEL_MAP_IND => {
-                // Master-initiated indications; no LL response is expected.  We do
-                // not yet apply the new parameters/channel map (known limitation).
+                // Master-initiated indications; no LL response is expected, so we
+                // ack them at the LL level and send nothing here.
+                //
+                // TODO(connection updates): we do NOT yet *apply* these.  Both carry
+                // an `Instant` (a connEventCount at which the change takes effect on
+                // both sides); correct handling must:
+                //   * LL_CHANNEL_MAP_IND — parse ChM(5) + Instant(2), stash them, and
+                //     when our event counter reaches Instant swap params.channel_map
+                //     (mind 16-bit wraparound of the instant vs. our counter).
+                //   * LL_CONNECTION_UPDATE_IND — parse WinSize/WinOffset/Interval/
+                //     Latency/Timeout + Instant, and at the Instant re-anchor and
+                //     re-time the whole event schedule.
+                // Until then, a master that actually switches maps/parameters mid-
+                // connection will desync us (missed events → supervision timeout).
+                // We have not been able to exercise this: observed masters send
+                // LL_CHANNEL_MAP_IND but do not appear to switch.
                 false
             }
             other => {
