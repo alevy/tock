@@ -602,19 +602,19 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
             }
         }
 
-        // Decide the payload for the next connection event (stop-and-wait flow
-        // control + LL control-PDU responses).
-        match self.tx_phase.get() {
+        // Advance the stop-and-wait flow-control state, then (if we are free to
+        // load a new payload) choose the next one.
+        let ready_for_next = match self.tx_phase.get() {
             TxPhase::AwaitingAck => {
                 if tx_acked {
-                    // Our content PDU was delivered (the radio transmitted an empty
-                    // PDU in its place this event); resume empty keep-alives.
-                    write_empty_ack(tx_buf);
-                    self.tx_fresh.set(false);
+                    // Outstanding content was delivered (the radio transmitted an
+                    // empty PDU in its place this event); free to load the next.
                     self.tx_phase.set(TxPhase::Idle);
+                    true
                 } else {
                     // Not yet acknowledged: retransmit by leaving tx_buf unchanged.
                     self.tx_fresh.set(false);
+                    false
                 }
             }
             TxPhase::FreshContent => {
@@ -622,18 +622,24 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
                 // for possible retransmission and await its acknowledgement.
                 self.tx_fresh.set(false);
                 self.tx_phase.set(TxPhase::AwaitingAck);
+                false
             }
-            TxPhase::Idle => {
-                // If the master sent a control PDU that needs a response, load it;
-                // otherwise send an empty keep-alive.
-                if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
-                    self.log_ctrl(true, tx_buf[2], tx_buf[1]);
-                    self.tx_fresh.set(true);
-                    self.tx_phase.set(TxPhase::FreshContent);
-                } else {
-                    write_empty_ack(tx_buf);
-                    self.tx_fresh.set(false);
-                }
+            TxPhase::Idle => true,
+        };
+
+        // Respond to a control PDU from the master if one needs answering,
+        // otherwise send an empty keep-alive.  This runs even in the event where we
+        // just became idle, so a control PDU that arrives as our previous response
+        // is acknowledged (the common FEATURE_RSP→VERSION_IND boundary) is not
+        // dropped.
+        if ready_for_next {
+            if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
+                self.log_ctrl(true, tx_buf[2], tx_buf[1]);
+                self.tx_fresh.set(true);
+                self.tx_phase.set(TxPhase::FreshContent);
+            } else {
+                write_empty_ack(tx_buf);
+                self.tx_fresh.set(false);
             }
         }
         self.tx_buf.replace(tx_buf);
