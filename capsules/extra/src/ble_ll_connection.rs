@@ -22,6 +22,7 @@
 use core::cell::Cell;
 
 use kernel::ErrorCode;
+use kernel::debug;
 use kernel::hil::ble_advertising::{
     BleConnectionDriver, ConnectionEventClient, ConnectionParams, ConnectionSetupClient,
     RadioChannel,
@@ -49,6 +50,13 @@ pub struct DebugEntry {
     pub anchor_ticks: u32,
     pub rx_ok: bool,
     pub event_counter: u32,
+    /// First received PDU header byte (`buf[0]`): LLID in the low two bits.
+    pub header: u8,
+    /// Received PDU payload length (`buf[1]`).
+    pub len: u8,
+    /// First payload byte (`buf[2]`): the control opcode when this is a control PDU.
+    /// Only meaningful when `rx_ok` is true; otherwise reflects stale/corrupt bytes.
+    pub opcode: u8,
 }
 
 impl DebugEntry {
@@ -58,6 +66,9 @@ impl DebugEntry {
             anchor_ticks: 0,
             rx_ok: false,
             event_counter: 0,
+            header: 0,
+            len: 0,
+            opcode: 0,
         }
     }
 }
@@ -227,23 +238,48 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
     }
 
     fn declare_connection_lost(&self) {
+        // Diagnostic: dump the recent connection-event history so we can see whether
+        // the master's PDUs (and any LL_TERMINATE_IND) were actually decoded.
+        self.dump_debug_log();
         self.state.set(State::Idle);
         self.params.set(None);
         self.disconnect_client.map(|c| c.connection_lost());
     }
 
-    fn log_event(&self, channel: u8, rx_ok: bool, anchor: u32) {
+    fn log_event(&self, channel: u8, rx_ok: bool, anchor: u32, header: u8, len: u8, opcode: u8) {
         let head = self.debug_log_head.get();
         let entry = DebugEntry {
             channel,
             anchor_ticks: anchor,
             rx_ok,
             event_counter: self.event_counter.get(),
+            header,
+            len,
+            opcode,
         };
         let mut log = self.debug_log.get();
         log[head % 16] = entry;
         self.debug_log.set(log);
         self.debug_log_head.set(head.wrapping_add(1));
+    }
+
+    // Print the ring buffer oldest-to-newest.  Called on teardown (connection is
+    // already over, so the cost of printing here does not perturb event timing).
+    fn dump_debug_log(&self) {
+        let log = self.debug_log.get();
+        let head = self.debug_log_head.get();
+        debug!("BLE conn debug log (oldest first):");
+        for i in 0..16 {
+            let e = log[head.wrapping_add(i) % 16];
+            // Skip never-populated slots.
+            if e.event_counter == 0 && e.header == 0 && !e.rx_ok {
+                continue;
+            }
+            debug!(
+                "  evt {} ch {} rx_ok {} hdr {:#04x} len {} op {:#04x}",
+                e.event_counter, e.channel, e.rx_ok, e.header, e.len, e.opcode
+            );
+        }
     }
 }
 
@@ -349,7 +385,12 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
 
         let rx_ok = result.is_ok();
         let channel = self.last_unmapped_channel.get(); // approximate for debug log
-        self.log_event(channel, rx_ok, anchor_ticks);
+        let (header, len, opcode) = if buf.len() >= 3 {
+            (buf[0], buf[1], buf[2])
+        } else {
+            (0, 0, 0)
+        };
+        self.log_event(channel, rx_ok, anchor_ticks, header, len, opcode);
 
         // A master-initiated disconnect arrives as an LL_TERMINATE_IND control PDU.
         // Our empty-PDU ACK for this event has already been sent by the hardware
