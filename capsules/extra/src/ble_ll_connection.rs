@@ -82,6 +82,18 @@ enum State {
     Connected,
 }
 
+/// Stop-and-wait state for the slave→master TX PDU.
+#[derive(Copy, Clone, PartialEq)]
+enum TxPhase {
+    /// Sending empty keep-alive PDUs; ready to start a new response.
+    Idle,
+    /// A content PDU is loaded and will be transmitted in the next event.
+    FreshContent,
+    /// The content PDU has been transmitted; awaiting the master's acknowledgement
+    /// (retransmit until then).
+    AwaitingAck,
+}
+
 /// BLE peripheral connection manager.
 ///
 /// Type parameters:
@@ -98,10 +110,13 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     /// Computed once per event; read both when arming the coarse alarm and when
     /// programming the hardware RX-open compare.
     next_open_time: Cell<u32>,
-    /// Whether the PDU we last transmitted has been acknowledged by the master.
-    /// Foundation for stop-and-wait flow control: a content-bearing PDU must be
-    /// held (retransmitted) until this becomes true before the next is loaded.
-    tx_acked: Cell<bool>,
+    /// Stop-and-wait phase for the outbound TX PDU.
+    tx_phase: Cell<TxPhase>,
+    /// Whether the currently-loaded TX PDU is fresh content (first transmission).
+    /// Passed to the driver so a first send is not suppressed by the ack guard.
+    tx_fresh: Cell<bool>,
+    /// Whether we have already sent our LL_VERSION_IND this connection (spec: once).
+    version_sent: Cell<bool>,
     last_unmapped_channel: Cell<u8>,
     missed_events: Cell<u16>,
 
@@ -152,8 +167,22 @@ fn window_widening(events_since_anchor: u32, conn_interval_us: u32) -> u32 {
 const LLID_MASK: u8 = 0b11;
 // LLID = 0b11 marks an LL Control PDU.
 const LLID_CONTROL: u8 = 0b11;
+// Base header byte for an LL Control PDU we transmit (LLID=0b11, MD=0); the radio
+// stamps the SN/NESN bits during the RX→TX turnaround.
+const CONTROL_PDU_HEADER: u8 = 0b11;
+
 // LL Control PDU opcodes (BT Core Spec Vol 6 Part B §2.4.2).
+const LL_UNKNOWN_RSP: u8 = 0x07;
 const LL_TERMINATE_IND: u8 = 0x02;
+const LL_FEATURE_REQ: u8 = 0x08;
+const LL_FEATURE_RSP: u8 = 0x09;
+const LL_SLAVE_FEATURE_REQ: u8 = 0x0E;
+const LL_VERSION_IND: u8 = 0x0C;
+const LL_CONNECTION_UPDATE_IND: u8 = 0x00;
+const LL_CHANNEL_MAP_IND: u8 = 0x01;
+
+// Bluetooth Core Specification version number for LL_VERSION_IND (5.3 = 0x0C).
+const LL_VERSNR: u8 = 0x0C;
 
 // True if `buf` is an LL Control PDU carrying LL_TERMINATE_IND.
 //
@@ -189,7 +218,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             event_counter: Cell::new(0),
             last_anchor_ticks: Cell::new(0),
             next_open_time: Cell::new(0),
-            tx_acked: Cell::new(false),
+            tx_phase: Cell::new(TxPhase::Idle),
+            tx_fresh: Cell::new(false),
+            version_sent: Cell::new(false),
             last_unmapped_channel: Cell::new(0),
             missed_events: Cell::new(0),
             rx_buf: TakeCell::new(rx_buf),
@@ -243,6 +274,63 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             .min(params.conn_interval_us.saturating_mul(2));
         let dt = self.alarm.ticks_from_us(delta_us);
         self.alarm.set_alarm(self.alarm.now(), dt);
+    }
+
+    // Build an LL control-PDU response into `tx` for a received control PDU, if one
+    // is warranted.  Returns true if a response PDU was written (its length is in
+    // `tx[1]`), false if no response is needed (caller should send an empty PDU).
+    //
+    // `rx_hdr` and `opcode` are the received PDU's header byte and first payload
+    // byte.  Only LL Control PDUs (LLID = 0b11) produce a response.
+    fn build_control_response(&self, rx_hdr: u8, opcode: u8, tx: &mut [u8]) -> bool {
+        if (rx_hdr & LLID_MASK) != LLID_CONTROL || tx.len() < 12 {
+            return false;
+        }
+        match opcode {
+            LL_FEATURE_REQ | LL_SLAVE_FEATURE_REQ => {
+                // LL_FEATURE_RSP: opcode + 8-byte FeatureSet.  We advertise no
+                // optional LL features (all zero), which is valid.
+                tx[0] = CONTROL_PDU_HEADER;
+                tx[1] = 9;
+                tx[2] = LL_FEATURE_RSP;
+                for b in tx[3..11].iter_mut() {
+                    *b = 0;
+                }
+                true
+            }
+            LL_VERSION_IND => {
+                // Reply with our LL_VERSION_IND once per connection (spec §5.1.5).
+                if self.version_sent.get() {
+                    return false;
+                }
+                self.version_sent.set(true);
+                // opcode + VersNr(1) + CompId(2, LE) + SubVersNr(2, LE)
+                tx[0] = CONTROL_PDU_HEADER;
+                tx[1] = 6;
+                tx[2] = LL_VERSION_IND;
+                tx[3] = LL_VERSNR;
+                tx[4] = 0xFF; // CompId 0xFFFF (unassigned / test)
+                tx[5] = 0xFF;
+                tx[6] = 0x00; // SubVersNr
+                tx[7] = 0x00;
+                true
+            }
+            LL_CONNECTION_UPDATE_IND | LL_CHANNEL_MAP_IND => {
+                // Master-initiated indications; no LL response is expected.  We do
+                // not yet apply the new parameters/channel map (known limitation).
+                false
+            }
+            other => {
+                // Any other control PDU is unsupported: reply LL_UNKNOWN_RSP with
+                // the offending opcode so the master's procedure does not stall
+                // for the full ~40 s response timeout (BT Core Spec §5.1.9).
+                tx[0] = CONTROL_PDU_HEADER;
+                tx[1] = 2;
+                tx[2] = LL_UNKNOWN_RSP;
+                tx[3] = other;
+                true
+            }
+        }
     }
 
     fn declare_connection_lost(&self) {
@@ -314,6 +402,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionSetupClient
         self.event_counter.set(0);
         self.missed_events.set(0);
         self.last_unmapped_channel.set(0);
+        self.tx_phase.set(TxPhase::Idle);
+        self.tx_fresh.set(false);
+        self.version_sent.set(false);
 
         // First connection event (BT Core Spec Vol 6 Part B §4.5.3):
         //   transmitWindowStart = end_of_CONNECT_IND + transmitWindowDelay + WinOffset
@@ -374,8 +465,11 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> AlarmClient for ConnectionMan
         let channel = RadioChannel::from_data_channel_index(channel_num)
             .unwrap_or(RadioChannel::DataChannel0);
 
+        let tx_fresh = self.tx_fresh.get();
         self.tx_buf.take().map(|tx| {
-            let _ = self.driver.connection_event_start(channel, tx, open_time);
+            let _ = self
+                .driver
+                .connection_event_start(channel, tx, open_time, tx_fresh);
         });
     }
 }
@@ -392,10 +486,6 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         anchor_ticks: u32,
         tx_acked: bool,
     ) {
-        // Record acknowledgement of our last transmitted PDU (stop-and-wait flow
-        // control foundation; not yet acted on while we only send empty PDUs).
-        self.tx_acked.set(tx_acked);
-
         let params = match self.params.get() {
             Some(p) => p,
             None => {
@@ -444,8 +534,39 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
             }
         }
 
-        // Prepare next TX PDU and return buffers to TakeCells.
-        write_empty_ack(tx_buf);
+        // Decide the payload for the next connection event (stop-and-wait flow
+        // control + LL control-PDU responses).
+        match self.tx_phase.get() {
+            TxPhase::AwaitingAck => {
+                if tx_acked {
+                    // Our content PDU was delivered (the radio transmitted an empty
+                    // PDU in its place this event); resume empty keep-alives.
+                    write_empty_ack(tx_buf);
+                    self.tx_fresh.set(false);
+                    self.tx_phase.set(TxPhase::Idle);
+                } else {
+                    // Not yet acknowledged: retransmit by leaving tx_buf unchanged.
+                    self.tx_fresh.set(false);
+                }
+            }
+            TxPhase::FreshContent => {
+                // The content PDU was transmitted once this event; keep it loaded
+                // for possible retransmission and await its acknowledgement.
+                self.tx_fresh.set(false);
+                self.tx_phase.set(TxPhase::AwaitingAck);
+            }
+            TxPhase::Idle => {
+                // If the master sent a control PDU that needs a response, load it;
+                // otherwise send an empty keep-alive.
+                if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
+                    self.tx_fresh.set(true);
+                    self.tx_phase.set(TxPhase::FreshContent);
+                } else {
+                    write_empty_ack(tx_buf);
+                    self.tx_fresh.set(false);
+                }
+            }
+        }
         self.tx_buf.replace(tx_buf);
         self.rx_buf.replace(buf);
 
