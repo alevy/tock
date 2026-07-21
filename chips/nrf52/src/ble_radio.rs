@@ -637,6 +637,9 @@ pub struct Radio<'a> {
     // the previous event (its NESN advanced past our SN).  Reported to the client
     // for stop-and-wait flow control; reset at the start of each event.
     conn_tx_acked: Cell<bool>,
+    // True when this event's pre-loaded TX PDU is fresh content being sent for the
+    // first time; suppresses the "empty on ack" retransmit guard for that event.
+    conn_tx_fresh: Cell<bool>,
 }
 
 impl<'a> Radio<'a> {
@@ -656,6 +659,7 @@ impl<'a> Radio<'a> {
             conn_sn: Cell::new(0),
             conn_nesn: Cell::new(0),
             conn_tx_acked: Cell::new(false),
+            conn_tx_fresh: Cell::new(false),
         }
     }
 
@@ -762,7 +766,19 @@ impl<'a> Radio<'a> {
                         // ACK bits the master sees reflect the packet just received.
                         let sn = self.conn_sn.get();
                         let nesn = self.conn_nesn.get();
+                        let acked = self.conn_tx_acked.get();
+                        let fresh = self.conn_tx_fresh.get();
                         if let Some(ptr) = self.conn_tx_buf.map(|b| {
+                            // If the master acknowledged our previous (already-
+                            // transmitted) PDU, don't retransmit its content with
+                            // the advanced SN — that would look like a new,
+                            // duplicate PDU.  Send an empty PDU instead.  Fresh
+                            // content (not yet transmitted) is exempt: it must go
+                            // out even though the prior PDU was just acked.
+                            if acked && !fresh && b.len() >= 2 {
+                                b[0] = 0x01; // LLID = 0b01 (empty)
+                                b[1] = 0x00; // length 0
+                            }
                             b[0] = (b[0] & !0b0000_1100) | (nesn << 2) | (sn << 3);
                             b.as_ptr() as u32
                         }) {
@@ -1042,6 +1058,7 @@ impl<'a> Radio<'a> {
         channel: RadioChannel,
         tx_buf: &'static mut [u8],
         open_time_ticks: u32,
+        tx_fresh: bool,
     ) -> Result<(), ErrorCode> {
         let params = match self.conn_params.get() {
             Some(p) => p,
@@ -1055,6 +1072,7 @@ impl<'a> Radio<'a> {
         self.conn_tx_buf.replace(tx_buf);
         self.conn_rx_ok.set(false);
         self.conn_tx_acked.set(false);
+        self.conn_tx_fresh.set(tx_fresh);
 
         // Power-cycle resets all radio registers; reconfigure fully each event.
         self.radio_on();
@@ -1205,8 +1223,9 @@ impl<'a> ble_advertising::BleConnectionDriver<'a> for Radio<'a> {
         channel: RadioChannel,
         tx_buf: &'static mut [u8],
         open_time_ticks: u32,
+        tx_fresh: bool,
     ) -> Result<(), ErrorCode> {
-        self.connection_event_start_impl(channel, tx_buf, open_time_ticks)
+        self.connection_event_start_impl(channel, tx_buf, open_time_ticks, tx_fresh)
     }
 
     fn get_timer0_now(&self) -> u32 {

@@ -121,11 +121,19 @@ pub trait BleConnectionDriver<'a> {
     /// contain a pre-formatted LL PDU (the ACK/empty PDU for this event);
     /// it is swapped in as the TX DMA pointer during the hardware RX→TX
     /// transition.
+    ///
+    /// `tx_fresh` marks `tx_buf` as a content PDU being transmitted for the
+    /// first time.  When the master's PDU acknowledges our previous
+    /// transmission, the driver normally suppresses re-sending the current
+    /// buffer's content (to avoid a duplicate with an advanced sequence
+    /// number); `tx_fresh` overrides that so a brand-new PDU is always sent
+    /// even if the prior one was just acknowledged.
     fn connection_event_start(
         &self,
         channel: RadioChannel,
         tx_buf: &'static mut [u8],
         open_time_ticks: u32,
+        tx_fresh: bool,
     ) -> Result<(), ErrorCode>;
 
     /// Return the current TIMER0 counter value (1 µs ticks).
