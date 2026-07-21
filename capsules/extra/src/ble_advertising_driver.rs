@@ -721,50 +721,17 @@ where
             }
         }
 
-        // Non-CONNECT_IND during kernel-mode advertising: advance to next channel.
+        // Non-CONNECT_IND during kernel-mode advertising (SCAN_REQ is the common case
+        // on Android active-scan): re-arm RX on the same channel and stay in the 3 ms
+        // window.  We cannot reply to SCAN_REQ within T_IFS in software, but keeping
+        // the radio in RX lets the central send CONNECT_IND if it chooses.
+        // Channel advancement is done solely by the alarm — this prevents Android from
+        // seeing the device vanish immediately after it sends SCAN_REQ, which would
+        // suppress the advertisement in nRF Connect.
         if self.receiving_app.is_none() {
-            match self.kernel_adv_state.get() {
-                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel37)) => {
-                    self.kernel_adv_expiration.set(Expiration::Disabled);
-                    self.kernel_adv_state.set(Some(BLEState::Advertising(
-                        RadioChannel::AdvertisingChannel38,
-                    )));
-                    self.kernel_tx.take().map(|buf| {
-                        let len = build_kernel_adv_pdu(buf);
-                        self.radio.transmit_advertisement(
-                            buf,
-                            len,
-                            RadioChannel::AdvertisingChannel38,
-                        );
-                    });
-                    return;
-                }
-                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel38)) => {
-                    self.kernel_adv_expiration.set(Expiration::Disabled);
-                    self.kernel_adv_state.set(Some(BLEState::Advertising(
-                        RadioChannel::AdvertisingChannel39,
-                    )));
-                    self.kernel_tx.take().map(|buf| {
-                        let len = build_kernel_adv_pdu(buf);
-                        self.radio.transmit_advertisement(
-                            buf,
-                            len,
-                            RadioChannel::AdvertisingChannel39,
-                        );
-                    });
-                    return;
-                }
-                Some(BLEState::AdvertisingRx(RadioChannel::AdvertisingChannel39)) => {
-                    self.kernel_adv_expiration.set(Expiration::Disabled);
-                    let now_u32 = self.alarm.now().into_u32();
-                    let delay = 50 * A::Frequency::frequency() / 1000;
-                    self.kernel_adv_expiration
-                        .set(Expiration::Enabled(now_u32, delay));
-                    self.kernel_adv_state.set(Some(BLEState::AdvertisingIdle));
-                    self.reset_active_alarm();
-                    return;
-                }
-                _ => {}
+            if let Some(BLEState::AdvertisingRx(ch)) = self.kernel_adv_state.get() {
+                self.radio.receive_advertisement(ch);
+                return;
             }
         }
 
