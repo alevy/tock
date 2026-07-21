@@ -218,6 +218,21 @@ const LL_CHANNEL_MAP_IND: u8 = 0x01;
 // Bluetooth Core Specification version number for LL_VERSION_IND (5.3 = 0x0C).
 const LL_VERSNR: u8 = 0x0C;
 
+// LLID = 0b10 marks the start of (or a complete) L2CAP message on a data PDU.
+const LLID_DATA_START: u8 = 0b10;
+// Base header byte for an L2CAP data PDU we transmit (LLID=0b10, MD=0); the radio
+// stamps the SN/NESN bits during the RX→TX turnaround.
+const DATA_PDU_HEADER: u8 = 0b10;
+
+// L2CAP / ATT constants for a minimal (attribute-less) GATT server whose only job
+// is to complete the client's transactions so the connection is not torn down.
+const L2CAP_CID_ATT: u16 = 0x0004;
+const ATT_MTU_DEFAULT: u16 = 23; // default LE ATT MTU; keeps ATT PDUs unfragmented
+const ATT_ERROR_RSP: u8 = 0x01;
+const ATT_EXCHANGE_MTU_REQ: u8 = 0x02;
+const ATT_EXCHANGE_MTU_RSP: u8 = 0x03;
+const ATT_ERR_ATTR_NOT_FOUND: u8 = 0x0A;
+
 // True if `buf` is an LL Control PDU carrying LL_TERMINATE_IND.
 //
 // `buf` layout: [0] = header (LLID in the low two bits), [1] = payload length,
@@ -235,6 +250,25 @@ fn write_empty_ack(buf: &mut [u8]) {
         buf[0] = 0x01; // LLID = 0b01 (continuation or empty)
         buf[1] = 0x00; // len = 0
     }
+}
+
+// Wrap an ATT payload in an L2CAP header and an LL data-PDU header, writing the
+// complete PDU into `tx`.  Returns false (no PDU written) if `tx` is too small.
+// The SN/NESN bits of `tx[0]` are stamped later by the radio.
+fn write_att_response(tx: &mut [u8], att: &[u8]) -> bool {
+    let total = 6 + att.len(); // LL header(2) + L2CAP header(4) + ATT payload
+    if tx.len() < total {
+        return false;
+    }
+    let l2cap_len = att.len() as u16;
+    tx[0] = DATA_PDU_HEADER;
+    tx[1] = (4 + att.len()) as u8; // LL payload length = L2CAP header + ATT payload
+    tx[2] = (l2cap_len & 0xff) as u8;
+    tx[3] = (l2cap_len >> 8) as u8;
+    tx[4] = (L2CAP_CID_ATT & 0xff) as u8;
+    tx[5] = (L2CAP_CID_ATT >> 8) as u8;
+    tx[6..total].copy_from_slice(att);
+    true
 }
 
 impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
@@ -310,6 +344,60 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             .min(params.conn_interval_us.saturating_mul(2));
         let dt = self.alarm.ticks_from_us(delta_us);
         self.alarm.set_alarm(self.alarm.now(), dt);
+    }
+
+    // Decide and build a response to the master's PDU, dispatching on the LLID:
+    // LL control PDUs (0b11) and L2CAP/ATT data PDUs (0b10).  Returns true if a
+    // response was written into `tx`, false if none is needed (send empty instead).
+    fn build_response(&self, rx: &[u8], tx: &mut [u8]) -> bool {
+        match rx.first().copied().unwrap_or(0) & LLID_MASK {
+            LLID_CONTROL => {
+                self.build_control_response(rx[0], rx.get(2).copied().unwrap_or(0), tx)
+            }
+            LLID_DATA_START => self.build_att_response(rx, tx),
+            _ => false,
+        }
+    }
+
+    // Respond to an ATT request on the L2CAP ATT channel.  We are a minimal server
+    // with no attributes: complete the MTU exchange and reject everything else with
+    // an error so the client's transactions finish instead of timing out.
+    //
+    // `rx` data PDU layout: [2..4] = L2CAP length, [4..6] = CID, [6..] = payload.
+    fn build_att_response(&self, rx: &[u8], tx: &mut [u8]) -> bool {
+        if rx.len() < 7 {
+            return false;
+        }
+        let cid = u16::from_le_bytes([rx[4], rx[5]]);
+        if cid != L2CAP_CID_ATT {
+            return false; // not ATT (e.g. LE signalling channel); ignore for now
+        }
+        let att_op = rx[6];
+        match att_op {
+            ATT_EXCHANGE_MTU_REQ => {
+                // Keep the default 23-byte MTU (small buffers, no fragmentation).
+                write_att_response(
+                    tx,
+                    &[
+                        ATT_EXCHANGE_MTU_RSP,
+                        (ATT_MTU_DEFAULT & 0xff) as u8,
+                        (ATT_MTU_DEFAULT >> 8) as u8,
+                    ],
+                )
+            }
+            _ => {
+                // No attributes: reply ATT_ERROR_RSP echoing the request opcode and
+                // its starting handle, with "Attribute Not Found".  For GATT
+                // discovery this is the normal end-of-results signal, so the client
+                // finishes discovery (finding no services) and keeps the link up.
+                let h_lo = rx.get(7).copied().unwrap_or(0);
+                let h_hi = rx.get(8).copied().unwrap_or(0);
+                write_att_response(
+                    tx,
+                    &[ATT_ERROR_RSP, att_op, h_lo, h_hi, ATT_ERR_ATTR_NOT_FOUND],
+                )
+            }
+        }
     }
 
     // Build an LL control-PDU response into `tx` for a received control PDU, if one
@@ -652,7 +740,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         // is acknowledged (the common FEATURE_RSP→VERSION_IND boundary) is not
         // dropped.
         if ready_for_next {
-            if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
+            if rx_ok && len >= 1 && self.build_response(buf, tx_buf) {
                 self.log_ctrl(true, tx_buf);
                 self.tx_fresh.set(true);
                 self.tx_phase.set(TxPhase::FreshContent);
