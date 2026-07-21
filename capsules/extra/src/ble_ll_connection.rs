@@ -43,18 +43,24 @@ const TIMER_SETUP_TICKS: u32 = 500;
 // transmit window opens this many µs after the end of the CONNECT_IND, plus WinOffset.
 const TRANSMIT_WINDOW_DELAY_US: u32 = 1250;
 
-/// One entry in the control-PDU diagnostic ring.
+/// One entry in the non-empty-PDU diagnostic ring.
 ///
-/// Records LL control traffic (both received and transmitted), which is rare
-/// enough that 16 entries capture an entire connection's handshake without being
-/// flooded by empty keep-alive PDUs.
+/// Records LL control PDUs *and* data (L2CAP/ATT) PDUs, in both directions.
+/// Non-empty PDUs are rare enough that 16 entries capture a whole connection's
+/// handshake without being flooded by empty keep-alive PDUs.
 #[derive(Copy, Clone)]
 pub struct CtrlEntry {
     pub event_counter: u32,
     /// false = received from master, true = transmitted by us.
     pub is_tx: bool,
-    pub opcode: u8,
+    /// PDU header byte (`buf[0]`): LLID in the low two bits (0b01 data/empty,
+    /// 0b10 data start, 0b11 control).
+    pub header: u8,
+    /// PDU payload length (`buf[1]`).
     pub len: u8,
+    /// First payload bytes (`buf[2..8]`): control opcode, or L2CAP length + CID +
+    /// ATT opcode for a data PDU.
+    pub payload: [u8; 6],
 }
 
 impl CtrlEntry {
@@ -62,8 +68,9 @@ impl CtrlEntry {
         CtrlEntry {
             event_counter: 0,
             is_tx: false,
-            opcode: 0,
+            header: 0,
             len: 0,
+            payload: [0; 6],
         }
     }
 }
@@ -362,15 +369,20 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         }
     }
 
-    // Record an LL control PDU (received or transmitted) in the control-PDU ring.
-    fn log_ctrl(&self, is_tx: bool, opcode: u8, len: u8) {
+    // Record a non-empty PDU (received or transmitted) in the diagnostic ring.
+    fn log_ctrl(&self, is_tx: bool, pdu: &[u8]) {
+        let mut payload = [0u8; 6];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = pdu.get(2 + i).copied().unwrap_or(0);
+        }
         let head = self.ctrl_log_head.get();
         let mut log = self.ctrl_log.get();
         log[head % 16] = CtrlEntry {
             event_counter: self.event_counter.get(),
             is_tx,
-            opcode,
-            len,
+            header: pdu.first().copied().unwrap_or(0),
+            len: pdu.get(1).copied().unwrap_or(0),
+            payload,
         };
         self.ctrl_log.set(log);
         self.ctrl_log_head.set(head.wrapping_add(1));
@@ -389,18 +401,24 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
     fn dump_ctrl_log(&self) {
         let log = self.ctrl_log.get();
         let head = self.ctrl_log_head.get();
-        debug!("BLE ctrl-PDU log (oldest first):");
+        debug!("BLE non-empty-PDU log (oldest first):");
         for i in 0..16 {
             let e = log[head.wrapping_add(i) % 16];
-            if e.event_counter == 0 && e.opcode == 0 && !e.is_tx {
+            if e.event_counter == 0 && e.header == 0 && !e.is_tx {
                 continue;
             }
             debug!(
-                "  evt {} {} op {:#04x} len {}",
+                "  evt {} {} hdr {:#04x} len {} payload {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
                 e.event_counter,
                 if e.is_tx { "TX" } else { "RX" },
-                e.opcode,
-                e.len
+                e.header,
+                e.len,
+                e.payload[0],
+                e.payload[1],
+                e.payload[2],
+                e.payload[3],
+                e.payload[4],
+                e.payload[5],
             );
         }
     }
@@ -569,9 +587,10 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         };
         self.log_event(channel, rx_ok, anchor_ticks, header, len, opcode, tx_acked);
 
-        // Diagnostic: record every received LL control PDU (rare vs empty PDUs).
-        if rx_ok && (header & LLID_MASK) == LLID_CONTROL && len >= 1 {
-            self.log_ctrl(false, opcode, len);
+        // Diagnostic: record every received non-empty PDU (control or L2CAP/ATT
+        // data), which is rare compared to empty keep-alive PDUs.
+        if rx_ok && len >= 1 {
+            self.log_ctrl(false, buf);
         }
 
         // A master-initiated disconnect arrives as an LL_TERMINATE_IND control PDU.
@@ -634,7 +653,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         // dropped.
         if ready_for_next {
             if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
-                self.log_ctrl(true, tx_buf[2], tx_buf[1]);
+                self.log_ctrl(true, tx_buf);
                 self.tx_fresh.set(true);
                 self.tx_phase.set(TxPhase::FreshContent);
             } else {
