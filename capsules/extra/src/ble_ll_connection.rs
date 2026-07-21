@@ -43,6 +43,31 @@ const TIMER_SETUP_TICKS: u32 = 500;
 // transmit window opens this many µs after the end of the CONNECT_IND, plus WinOffset.
 const TRANSMIT_WINDOW_DELAY_US: u32 = 1250;
 
+/// One entry in the control-PDU diagnostic ring.
+///
+/// Records LL control traffic (both received and transmitted), which is rare
+/// enough that 16 entries capture an entire connection's handshake without being
+/// flooded by empty keep-alive PDUs.
+#[derive(Copy, Clone)]
+pub struct CtrlEntry {
+    pub event_counter: u32,
+    /// false = received from master, true = transmitted by us.
+    pub is_tx: bool,
+    pub opcode: u8,
+    pub len: u8,
+}
+
+impl CtrlEntry {
+    const fn zero() -> Self {
+        CtrlEntry {
+            event_counter: 0,
+            is_tx: false,
+            opcode: 0,
+            len: 0,
+        }
+    }
+}
+
 /// One entry in the debug ring buffer — populated after each connection event.
 #[derive(Copy, Clone)]
 pub struct DebugEntry {
@@ -126,6 +151,8 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     // Debug
     debug_log: Cell<[DebugEntry; 16]>,
     debug_log_head: Cell<usize>,
+    ctrl_log: Cell<[CtrlEntry; 16]>,
+    ctrl_log_head: Cell<usize>,
     /// When true, always use DataChannel0 regardless of CSA#1.
     pub single_channel_test: Cell<bool>,
 
@@ -227,6 +254,8 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             tx_buf: TakeCell::new(tx_buf),
             debug_log: Cell::new([DebugEntry::zero(); 16]),
             debug_log_head: Cell::new(0),
+            ctrl_log: Cell::new([CtrlEntry::zero(); 16]),
+            ctrl_log_head: Cell::new(0),
             single_channel_test: Cell::new(false),
             disconnect_client: OptionalCell::empty(),
         }
@@ -333,13 +362,47 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         }
     }
 
+    // Record an LL control PDU (received or transmitted) in the control-PDU ring.
+    fn log_ctrl(&self, is_tx: bool, opcode: u8, len: u8) {
+        let head = self.ctrl_log_head.get();
+        let mut log = self.ctrl_log.get();
+        log[head % 16] = CtrlEntry {
+            event_counter: self.event_counter.get(),
+            is_tx,
+            opcode,
+            len,
+        };
+        self.ctrl_log.set(log);
+        self.ctrl_log_head.set(head.wrapping_add(1));
+    }
+
     fn declare_connection_lost(&self) {
-        // Diagnostic: dump the recent connection-event history so we can see whether
-        // the master's PDUs (and any LL_TERMINATE_IND) were actually decoded.
+        // Diagnostic: dump the recent connection-event history and the full control-
+        // PDU handshake so we can see which LL procedure (if any) failed to complete.
         self.dump_debug_log();
+        self.dump_ctrl_log();
         self.state.set(State::Idle);
         self.params.set(None);
         self.disconnect_client.map(|c| c.connection_lost());
+    }
+
+    fn dump_ctrl_log(&self) {
+        let log = self.ctrl_log.get();
+        let head = self.ctrl_log_head.get();
+        debug!("BLE ctrl-PDU log (oldest first):");
+        for i in 0..16 {
+            let e = log[head.wrapping_add(i) % 16];
+            if e.event_counter == 0 && e.opcode == 0 && !e.is_tx {
+                continue;
+            }
+            debug!(
+                "  evt {} {} op {:#04x} len {}",
+                e.event_counter,
+                if e.is_tx { "TX" } else { "RX" },
+                e.opcode,
+                e.len
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -506,6 +569,11 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
         };
         self.log_event(channel, rx_ok, anchor_ticks, header, len, opcode, tx_acked);
 
+        // Diagnostic: record every received LL control PDU (rare vs empty PDUs).
+        if rx_ok && (header & LLID_MASK) == LLID_CONTROL && len >= 1 {
+            self.log_ctrl(false, opcode, len);
+        }
+
         // A master-initiated disconnect arrives as an LL_TERMINATE_IND control PDU.
         // Our empty-PDU ACK for this event has already been sent by the hardware
         // (RX→TX turnaround), which is the acknowledgement the master waits for, so
@@ -559,6 +627,7 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
                 // If the master sent a control PDU that needs a response, load it;
                 // otherwise send an empty keep-alive.
                 if rx_ok && len >= 1 && self.build_control_response(header, opcode, tx_buf) {
+                    self.log_ctrl(true, tx_buf[2], tx_buf[1]);
                     self.tx_fresh.set(true);
                     self.tx_phase.set(TxPhase::FreshContent);
                 } else {
