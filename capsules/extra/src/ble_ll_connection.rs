@@ -75,6 +75,34 @@ impl CtrlEntry {
     }
 }
 
+/// Maximum size of a queued outbound PDU (header + payload).  Comfortably fits
+/// our control PDUs and ATT responses at the default 23-byte MTU.
+const RESP_PDU_MAX: usize = 32;
+/// Depth of the outbound response queue.  Only a couple of responses are ever
+/// in flight at once (e.g. an LL procedure response overlapping an ATT one), so
+/// this is generous.
+const RESP_QUEUE_LEN: usize = 4;
+
+/// A pre-built outbound PDU awaiting transmission.
+///
+/// The stop-and-wait TX drains one queued response per acknowledged event, so
+/// requests that arrive while a response is in flight are answered later rather
+/// than dropped.
+#[derive(Copy, Clone)]
+struct RespEntry {
+    pdu: [u8; RESP_PDU_MAX],
+    nbytes: u8,
+}
+
+impl RespEntry {
+    const fn zero() -> Self {
+        RespEntry {
+            pdu: [0; RESP_PDU_MAX],
+            nbytes: 0,
+        }
+    }
+}
+
 /// One entry in the debug ring buffer — populated after each connection event.
 #[derive(Copy, Clone)]
 pub struct DebugEntry {
@@ -149,6 +177,13 @@ pub struct ConnectionManager<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> {
     tx_fresh: Cell<bool>,
     /// Whether we have already sent our LL_VERSION_IND this connection (spec: once).
     version_sent: Cell<bool>,
+
+    // Outbound response queue: built responses awaiting transmission, drained one
+    // at a time by the stop-and-wait TX so overlapping/pipelined requests are not
+    // dropped.
+    resp_queue: Cell<[RespEntry; RESP_QUEUE_LEN]>,
+    resp_head: Cell<usize>,
+    resp_count: Cell<usize>,
     last_unmapped_channel: Cell<u8>,
     missed_events: Cell<u16>,
 
@@ -289,6 +324,9 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             tx_phase: Cell::new(TxPhase::Idle),
             tx_fresh: Cell::new(false),
             version_sent: Cell::new(false),
+            resp_queue: Cell::new([RespEntry::zero(); RESP_QUEUE_LEN]),
+            resp_head: Cell::new(0),
+            resp_count: Cell::new(0),
             last_unmapped_channel: Cell::new(0),
             missed_events: Cell::new(0),
             rx_buf: TakeCell::new(rx_buf),
@@ -344,6 +382,39 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
             .min(params.conn_interval_us.saturating_mul(2));
         let dt = self.alarm.ticks_from_us(delta_us);
         self.alarm.set_alarm(self.alarm.now(), dt);
+    }
+
+    // Append a built PDU to the outbound response queue.  Dropped if the queue is
+    // full (should not happen given the depth and the sequential request model).
+    fn enqueue_response(&self, pdu: &[u8]) {
+        let count = self.resp_count.get();
+        if count >= RESP_QUEUE_LEN {
+            return;
+        }
+        let n = pdu.len().min(RESP_PDU_MAX);
+        let mut entry = RespEntry::zero();
+        entry.pdu[..n].copy_from_slice(&pdu[..n]);
+        entry.nbytes = n as u8;
+        let slot = (self.resp_head.get() + count) % RESP_QUEUE_LEN;
+        let mut q = self.resp_queue.get();
+        q[slot] = entry;
+        self.resp_queue.set(q);
+        self.resp_count.set(count + 1);
+    }
+
+    // Pop the oldest queued response into `tx`, returning true if one was pending.
+    fn dequeue_response_into(&self, tx: &mut [u8]) -> bool {
+        let count = self.resp_count.get();
+        if count == 0 {
+            return false;
+        }
+        let head = self.resp_head.get();
+        let entry = self.resp_queue.get()[head];
+        let n = (entry.nbytes as usize).min(tx.len()).min(RESP_PDU_MAX);
+        tx[..n].copy_from_slice(&entry.pdu[..n]);
+        self.resp_head.set((head + 1) % RESP_QUEUE_LEN);
+        self.resp_count.set(count - 1);
+        true
     }
 
     // Decide and build a response to the master's PDU, dispatching on the LLID:
@@ -574,6 +645,8 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionSetupClient
         self.tx_phase.set(TxPhase::Idle);
         self.tx_fresh.set(false);
         self.version_sent.set(false);
+        self.resp_head.set(0);
+        self.resp_count.set(0);
 
         // First connection event (BT Core Spec Vol 6 Part B §4.5.3):
         //   transmitWindowStart = end_of_CONNECT_IND + transmitWindowDelay + WinOffset
@@ -709,8 +782,21 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
             }
         }
 
-        // Advance the stop-and-wait flow-control state, then (if we are free to
-        // load a new payload) choose the next one.
+        // If the master's PDU this event needs a response, build it and queue it.
+        // Queuing (rather than sending it immediately) means a request that arrives
+        // while an earlier response is still in flight — e.g. the ATT MTU request
+        // pipelined right after the LL version exchange — is answered later instead
+        // of dropped.
+        if rx_ok && len >= 1 {
+            let mut scratch = [0u8; RESP_PDU_MAX];
+            if self.build_response(buf, &mut scratch) {
+                let n = (2 + scratch[1] as usize).min(RESP_PDU_MAX);
+                self.enqueue_response(&scratch[..n]);
+            }
+        }
+
+        // Advance the stop-and-wait flow-control state, then (if we are free to load
+        // a new payload) send the next queued response, or an empty keep-alive.
         let ready_for_next = match self.tx_phase.get() {
             TxPhase::AwaitingAck => {
                 if tx_acked {
@@ -734,13 +820,8 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionEventClient
             TxPhase::Idle => true,
         };
 
-        // Respond to a control PDU from the master if one needs answering,
-        // otherwise send an empty keep-alive.  This runs even in the event where we
-        // just became idle, so a control PDU that arrives as our previous response
-        // is acknowledged (the common FEATURE_RSP→VERSION_IND boundary) is not
-        // dropped.
         if ready_for_next {
-            if rx_ok && len >= 1 && self.build_response(buf, tx_buf) {
+            if self.dequeue_response_into(tx_buf) {
                 self.log_ctrl(true, tx_buf);
                 self.tx_fresh.set(true);
                 self.tx_phase.set(TxPhase::FreshContent);
