@@ -495,7 +495,16 @@ impl<'a, D: BleConnectionDriver<'a>, A: Alarm<'a>> ConnectionManager<'a, D, A> {
         if cid != L2CAP_CID_ATT {
             return false; // not ATT (e.g. LE signalling channel); ignore for now
         }
-        let att = &rx[6..];
+        // Bound the ATT PDU to its actual length.  The L2CAP length field (rx[2..4])
+        // is the ATT payload size; clamp it to the LL payload length (rx[1]) and the
+        // buffer so we never read stale bytes past the received PDU — otherwise a
+        // short write would store trailing garbage as the characteristic value.
+        let l2cap_len = u16::from_le_bytes([rx[2], rx[3]]) as usize;
+        let end = (6 + l2cap_len).min(2 + rx[1] as usize).min(rx.len());
+        if end < 7 {
+            return false;
+        }
+        let att = &rx[6..end];
         match att[0] {
             ATT_EXCHANGE_MTU_REQ => write_att_response(
                 tx,
