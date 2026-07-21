@@ -514,6 +514,19 @@ where
     }
 }
 
+// When the connection manager reports the connection is over (clean
+// LL_TERMINATE_IND or supervision timeout), resume connectable advertising so the
+// device can be rediscovered and reconnected without a power cycle.
+impl<'a, B, A> crate::ble_ll_connection::DisconnectClient for BLE<'a, B, A>
+where
+    B: ble_advertising::BleAdvertisementDriver<'a> + ble_advertising::BleConfig,
+    A: kernel::hil::time::Alarm<'a>,
+{
+    fn connection_lost(&self) {
+        self.start_connectable_advertising();
+    }
+}
+
 // Timer alarm
 impl<'a, B, A> kernel::hil::time::AlarmClient for BLE<'a, B, A>
 where
