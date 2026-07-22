@@ -311,3 +311,101 @@ HIL is the recommended next design step.
 - ATT: **Vol 3, Part F** (PDU formats, opcodes, error codes).
 - GATT: **Vol 3, Part G** (service/characteristic/descriptor model,
   discovery procedures).
+
+---
+
+## 9. Breadth of SoC support — Zephyr parity & the HCI boundary
+
+Research question: if we want to support BLE across many SoCs (medical,
+automotive, wearables, home IoT), what's the cheapest path, and how far does an
+**HCI-based interface** get us? Findings below are from Zephyr's structure +
+vendor docs (verified via web search 2026-07; fine details worth re-checking).
+
+### What Zephyr does (the reference)
+
+- Zephyr runs its **own open-source Controller (link layer) on essentially only
+  Nordic** (nRF51/52/53) plus one Nordic-derived "proprietary radio" (openisa
+  RV32M1). That's the raw-radio tier — tiny.
+- **Every other family is reached via an HCI driver** to a vendor/coprocessor
+  controller. HCI is a Bluetooth-SIG standard (commands/events/ACL framing),
+  identical across controllers. Zephyr's `drivers/bluetooth/hci/`:
+  - Generic transports: `h4.c` (UART), H5 (3-wire), SPI, **IPC/RPMsg**
+    (multi-core), `userchan` (Linux).
+  - Vendor/coprocessor: STM32WB (`ipm_stm32wb.c`, shared-RAM IPM → M0 blob),
+    STM32WBA, STM32WB0, ESP32 (`hci_esp32.c`, VHCI), Silabs EFR32
+    (`hci_silabs_efr32.c`), NXP (`hci_nxp.c`), Infineon CYW208xx + PSoC6 BLESS,
+    Realtek Ameba.
+
+Per-chip interface confirmations:
+
+- **NXP KW45** (automotive; BLE 6.0 + CAN FD/LIN): CM33 app core + a **dedicated
+  CM3 "NBU" radio core** (own flash, upgradeable software radio) reached over
+  HCI — category-3 coprocessor.
+- **STM32WB:** HCI over IPCC/IPM to a Cortex-M0 running ST's coprocessor binary
+  (flash "Full stack" or "HCI Layer").
+- **ADI MAX3266x / MAX32655 (Cordio):** on-chip controller; the split point is
+  **HCI over UART**; controller can be built standalone; even a dual-core
+  (Arm+RISC-V) split-HCI mode exists.
+- **Silabs EFR32:** can run its LL on-chip over RAIL, but Zephyr still reaches it
+  via an **HCI driver**.
+- **TI CC13xx/CC26xx:** proprietary **RF-core command mailbox**, *not* HCI —
+  outside the HCI umbrella (Zephyr largely doesn't do BLE on them either).
+
+### Interface taxonomy (the design lens)
+
+1. **Raw radio + software LL** (own PHY timing): Nordic nRF5x. *Rare — the
+   current Tock impl.*
+2. **On-chip LL over a vendor radio HAL:** Silabs (RAIL), STM32WBA, ADI MAX32
+   (Cordio), Dialog/Renesas DA14xxx. Usually still exposes an HCI seam.
+3. **HCI to on-chip coprocessor** (IPC/shared-mem/mailbox): STM32WB, ESP32,
+   nRF5340/nRF54H net core, NXP KW45.
+4. **HCI to external chip** (UART/SPI): Infineon AIROC/CYW43, generic modules.
+
+Categories 3 & 4 (and most of 2 via their HCI seam) dominate the non-Nordic
+market. Nordic (cat 1) is the outlier.
+
+### Verdict on "HCI ≈ 99% of the way to 99% parity"
+
+Directionally correct, with the cost in a different place than "a SPI driver":
+
+- **True at the protocol level:** HCI is standardized, so one portable HCI host
+  covers *all* HCI controllers; the marginal per-SoC work collapses to transport
+  + bring-up glue.
+- **Correction 1 — the dominant cost is the one-time, shared HCI *host* stack**
+  (full GAP central+peripheral, GATT client+server, SMP pairing/bonding, L2CAP
+  incl. CoC, privacy/RPA). Paid once, amortized over every chip. Our current
+  host is a sliver (peripheral-only, one GATT server, no SMP/CoC).
+- **Correction 2 — "transport" is ~3 families,** only one of which is literally
+  a SPI driver: UART (H4/H5) and SPI are cheap (Tock has these on many chips);
+  **IPC/shared-mem** (STM32WB IPCC, nRF5340 RPMsg, ESP32 VHCI) is real inter-core
+  plumbing, and several parts need **firmware provisioning** (flash/upload a
+  vendor blob) — the lumpy per-vendor tax.
+- **Correction 3 — a few families are outside pure HCI:** TI RF-core (bespoke
+  shim), and the raw-radio tier (Nordic) which needs the full software LL (mostly
+  already built here).
+
+### Parity ladder (effort → what it unlocks)
+
+| Effort | Unlocks |
+|--------|---------|
+| Portable **HCI host** (GAP/L2CAP/ATT/GATT/SMP) + **H4/UART** transport | Any external HCI module over UART; testable with a cheap dongle |
+| + **SPI** transport | SPI-attached controllers (some Infineon/Realtek/modules) |
+| + **IPC/shared-mem** transport (one RPMsg-ish pattern) | nRF5340 net core, STM32WB (IPM), ESP32 (VHCI) |
+| + per-vendor **bring-up glue** (firmware load, vendor HCI extensions, power seq) | Turns "transport works" into "chip boots BLE" |
+| + keep the **nRF raw-radio LL behind an HCI shim** | Parity on the raw-radio tier without special-casing the host |
+| + (optional) **TI RF-core shim** | The non-HCI holdout |
+
+### Recommendation
+
+Make **HCI the durable host/controller boundary.** Build a portable HCI host
+(non-timing-sensitive, off-chip — the "up the stack" direction) and treat the
+existing nRF raw-radio LL as one Tock-resident controller behind an HCI shim.
+This gets most of Zephyr's SoC *breadth* cheaply on the per-chip axis; budget the
+*host stack* as the real work, and IPC transports + firmware provisioning as the
+bumpy per-vendor bits. Validate against one HCI controller first (an external
+UART dongle is the simplest; Apollo3 is in-tree).
+
+Sources: Zephyr Bluetooth features & controller-arch docs; Zephyr
+`drivers/bluetooth/hci/` (`h4.c`, `ipm_stm32wb.c`, `hci_stm32wba.c`,
+`hci_esp32.c`, `hci_silabs_efr32.c`, `nxp,hci-ble`, `infineon,cyw208xx-hci`);
+NXP KW45 product/blog pages; ADI Cordio BLE User Guide + Zephyr MAX32655 board.
