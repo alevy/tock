@@ -409,3 +409,136 @@ Sources: Zephyr Bluetooth features & controller-arch docs; Zephyr
 `drivers/bluetooth/hci/` (`h4.c`, `ipm_stm32wb.c`, `hci_stm32wba.c`,
 `hci_esp32.c`, `hci_silabs_efr32.c`, `nxp,hci-ble`, `infineon,cyw208xx-hci`);
 NXP KW45 product/blog pages; ADI Cordio BLE User Guide + Zephyr MAX32655 board.
+
+---
+
+## 10. Kernel & user-space architecture: virtualizing the subsystem
+
+Tock differs from Zephyr: it must serve **multiple mutually-distrustful apps
+concurrently over virtualized hardware**, not cooperating tasks. That makes a
+naive "one app owns the radio" interface unsatisfying. Design framing below
+(discussion, not yet committed — the Model A/B fork is an open decision).
+
+### The two-layer split (don't conflate these)
+
+BLE virtualization is **two problems at two layers**:
+- **(a) radio / role multiplexing at the controller** — a *scheduling* problem.
+- **(b) application multiplexing at GATT** — a *namespace + access-control*
+  problem (this is what Beetle [MobiSys'16] solved for gateways).
+
+Both sit **above the HCI-shaped controller boundary** from §9, which is what
+keeps the whole thing portable.
+
+### Advertising vs connected: one subsystem, not two interfaces
+
+The radio is singular; concurrent roles (advertise / scan / connect) need **one
+scheduler that owns the radio timeline**. Two interfaces both grabbing the radio
+is the `BleTestAdvertiser` mistake at scale. HCI already models this exactly
+(advertising sets + scan + N connections as concurrent controller activities) —
+so the host-facing interface should be "**activities on a controller**," and on
+a real controller the concurrency comes for free. Capability gradient the
+interface must express (and degrade gracefully — BUSY / capability query):
+
+- multiple **non-connectable advertisers** (beacons): cheap, time-sliced — Tock
+  does this today;
+- **advertising + one connection**: needs interleaving adv into the connection's
+  gaps — moderate LL-scheduler work on our nRF radio; native on HCI controllers;
+- **multiple connections**: heavy; real embedded controllers support a small N.
+
+### OPEN DECISION — "virtual devices" (A) vs "one device, virtualized GATT" (B)
+
+- **Model A (today):** each app = a distinct advertised device (own identity).
+  Extends to connections only as *N independent connections/identities* —
+  impractical (a phone sees N devices; controller holds N links).
+- **Model B (Beetle-shaped):** one identity, one connection (or few), GATT table
+  composed from apps. Practical; matches BLE idiom (a phone sees one device with
+  many services).
+- **Current lean:** keep **A for non-connectable/beacon** use (cheap, real
+  isolation), **converge connectable/connected operation on B**. Connections
+  force B. *This is the pivotal call and cascades into everything above it —
+  needs a deliberate decision.*
+
+### Virtualize at GATT, not L2CAP
+
+Forced by the protocol: there is exactly **one ATT channel (fixed CID 0x0004)
+per connection**, so you cannot give each app its own ATT channel — the sharing
+point is the GATT handle space. Multiplexing therefore *must* be at GATT (route
+by handle, fan out notifications, per-characteristic ownership/ACL). That is
+Beetle's thesis, and here it's not a preference. (L2CAP **CoC** virtualization =
+socket-per-app is clean and worth offering for the raw-stream minority, but GATT
+is the 80% case.) Two GATT virtualizations, both at the GATT layer:
+- **Peripheral (Tock exposes a server):** compose one GATT table from per-process
+  attribute contributions; route incoming ATT ops to the owning process; each
+  process owns its characteristics + notifications. **The immediate common case
+  — start here.**
+- **Central/gateway (Tock accesses remote peripherals):** Beetle's exact scenario
+  — cross-device handle mapping, subscription fan-out, policy, caching. Later.
+
+### Kernel or user space?
+
+Put the **core GATT mux in a kernel capsule**; push rich policy to user space.
+Rationale: Beetle was a user-space daemon because the *Linux* kernel is a
+general-purpose OS with no business embedding BLE policy. **Tock inverts this —
+capsules *are* the purpose-built trusted mediation layer**, and the ATT-channel
+demux + GATT-table composition + op-routing is the standard Tock virtualizer
+pattern (own a shared resource, route to processes via grants + upcalls, enforce
+ownership at registration) — same shape as `VirtualMuxAlarm` / virtual UART. A
+capsule avoids a mandatory universally-trusted broker process and the double
+process-boundary crossing per ATT op. Keep the capsule minimal: ownership +
+routing + notification fan-out, coarse/static policy. In the peripheral capsule
+"access control" mostly reduces to **ownership** (a process owns its handle
+range; only it gets that range's writes and may push its notifications);
+cross-app access is where real *policy* enters — defer, or gate behind explicit
+capabilities / board config. The richer Beetle features (dynamic policy,
+central-mode cross-device brokering, GATT-over-network bridging) → a **user-space
+service on top**, esp. for gateway deployments.
+
+### Layering sketch
+
+```
+processes   ── register attributes; read/write/subscribe upcalls; push notifications
+   │ (syscall)
+GattServer mux capsule   ── compose table, assign handles, route by handle, per-proc CCCD/notify
+L2capMux capsule         ── demux by CID → ATT / signalling(CoC) / SMP
+LinkController (HCI-shaped) ── activities: adv sets, scan, connections; ACL data in/out
+   └── vendor HCI controller  OR  our nRF raw-radio LL behind an HCI shim
+```
+Everything from `L2capMux` up is portable, write-once, rides any controller.
+
+### Isochronous streams (LE Audio) — a MISSING, orthogonal data path
+
+The sketch above covers only the **ACL → L2CAP → GATT** path. BLE 5.2 **LE Audio
+/ Isochronous Channels (ISO)** are **not** carried over L2CAP and are currently
+**scoped out**. This is not a flaw in the GATT design (ISO is orthogonal), but
+the subsystem architecture must reserve a place for it:
+
+- **Two flavours:** **CIS** (Connected Isochronous Stream, in a CIG —
+  point-to-point, bidirectional: earbuds, hearing aids) and **BIS** (Broadcast
+  Isochronous Stream, in a BIG — Auracast broadcast).
+- **Separate controller data path.** ISO SDUs go through the **ISOAL**
+  (Isochronous Adaptation Layer, seg/reassembly + timing) to ISO PDUs, carried as
+  **HCI ISO data packets** — a *sibling* of the ACL data path, **bypassing
+  L2CAP/ATT/GATT entirely**. It slots in cleanly next to `L2capMux` at the
+  controller boundary; it does not disturb the GATT design.
+- **Split plane:** LE Audio's **control plane** (BAP/ASCS/PACS/VCP/MCP/CSIP…) is
+  **GATT-based** → reuses the portable GATT path. Only the **media plane** is ISO.
+- **Harder real-time than connections.** ISO has presentation-time / bounded-
+  latency semantics and is *lossy* (flush timeout, limited retransmission), not
+  reliable like ATT. Scheduling CIS/BIS events alongside connection events on one
+  radio is a serious real-time burden on a raw-radio LL → **strong extra argument
+  for the HCI boundary** (lean on a LE-Audio-capable controller's ISO; building
+  it on our own nRF52 LL would be a major effort, and **nRF52 largely lacks LE
+  Audio — nRF5340 + a capable controller has it**; capability-gated, query it).
+- **Different virtualization model.** A stream is real-time media with QoS, not an
+  attribute — it does **not** fit GATT-style sharing. The natural model is
+  **exclusive assignment of a CIS/BIS to one app** (multiple streams → multiple
+  apps, but each stream owned), closer to the CoC "stream socket" model with
+  isochronous QoS. The **LC3 codec** is a compute/media concern (app / user space
+  / hardware codec), out of this layering.
+- **Placement:** ISO data path + ISOAL is timing-sensitive → kernel capsule
+  adjacent to `LinkController`; LE Audio profiles ride the portable GATT path;
+  media source/sink + codec live above.
+
+Bottom line: reserve **ISO as a peer of L2CAP at the controller boundary**, with
+its own exclusive-stream virtualization; it reuses GATT for control but needs a
+separate real-time media path and (realistically) an LE-Audio-capable controller.
