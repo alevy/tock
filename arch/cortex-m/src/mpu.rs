@@ -228,15 +228,23 @@ impl<const NUM_REGIONS: usize> fmt::Display for CortexMConfig<NUM_REGIONS> {
                     access_bits,
                 )?;
                 let subregion_bits = region.attributes().read(RegionAttributes::SRD);
-                let subregion_size = location.1 / 8;
+                // Subregions divide the underlying block, which is often larger
+                // than the logical region exposed to the process, so their
+                // bounds have to come from the hardware encoding rather than
+                // from `location`. The block is `2^(SIZE+1)` bytes based at
+                // `ADDR << 5`, and holds eight subregions.
+                let block_start =
+                    (region.base_address().read(RegionBaseAddress::ADDR) as usize) << 5;
+                let subregion_size =
+                    1_usize << (region.attributes().read(RegionAttributes::SIZE) - 2);
                 for j in 0..8 {
                     write!(
                         f,
                         "\
                          \r\n    Sub-region {}: [{:#010X}:{:#010X}], {}",
                         j,
-                        start + j * subregion_size,
-                        start + (j + 1) * subregion_size,
+                        block_start + j * subregion_size,
+                        block_start + (j + 1) * subregion_size,
                         if (subregion_bits >> j) & 1 == 0 {
                             "Enabled"
                         } else {
@@ -263,6 +271,114 @@ impl<const NUM_REGIONS: usize> CortexMConfig<NUM_REGIONS> {
             }
         }
         None
+    }
+}
+
+/// The geometry of a single Cortex-M MPU region.
+///
+/// The hardware can only express a region as a *block* whose size is a power of
+/// two and whose base address is a multiple of that size. The block is divided
+/// into exactly eight equally sized subregions, each of which can be
+/// individually enabled. The logical region a process sees is therefore a
+/// contiguous run of enabled subregions somewhere inside the block.
+//#[derive(Copy, Clone)]
+struct RegionGeometry {
+    /// Start of the logical region (the first enabled subregion).
+    start: usize,
+    /// Length of the logical region.
+    size: usize,
+    /// Base address of the underlying block.
+    block_start: usize,
+    /// Size of the underlying block; always eight subregions.
+    block_size: usize,
+    /// Index of the first enabled subregion within the block.
+    first_subregion: usize,
+    /// Index of the last enabled subregion within the block.
+    last_subregion: usize,
+}
+
+impl RegionGeometry {
+    /// Find the smallest expressible region of at least `min_size` bytes that
+    /// fits within `[window_start, window_end)`.
+    ///
+    /// Because every subregion in a block has the same size, a run of `count`
+    /// subregions of `subregion_size` bytes can only be expressed when the run
+    /// starts on a `subregion_size` boundary and does not cross the end of its
+    /// block, that is when `index + count <= 8` for the index of the first
+    /// enabled subregion. Rather than guess a subregion size from the alignment
+    /// of the window (which rejects layouts the hardware can represent), we
+    /// enumerate every `(subregion_size, count)` pair the hardware can encode,
+    /// compute the earliest start address each admits, and keep the smallest
+    /// region found. Ties are broken towards the lowest start address.
+    fn fit(window_start: usize, window_end: usize, min_size: usize) -> Option<Self> {
+        let window_size = window_end.checked_sub(window_start)?;
+        let mut best: Option<Self> = None;
+
+        let mut subregion_size = CORTEXM_MIN_REGION_SIZE;
+        loop {
+            if subregion_size > window_size {
+                break;
+            }
+            // Blocks smaller than eight times the minimum subregion size cannot
+            // use subregions at all, so the block is always eight subregions.
+            let Some(block_size) = subregion_size.checked_mul(8) else {
+                break;
+            };
+
+            for count in 1..=8 {
+                // Cannot overflow: `subregion_size * 8` is known to fit.
+                let size = subregion_size * count;
+                if size > window_size {
+                    // `size` only grows with `count`.
+                    break;
+                }
+                if size < min_size {
+                    continue;
+                }
+
+                // Earliest subregion-aligned address at or after the window
+                // start, advanced to the next block if a run of `count`
+                // subregions would overrun the block it lands in.
+                let Some(mut start) = window_start
+                    .div_ceil(subregion_size)
+                    .checked_mul(subregion_size)
+                else {
+                    continue;
+                };
+                let index = (start / subregion_size) % 8;
+                if index + count > 8 {
+                    let Some(next_block) = start.checked_add((8 - index) * subregion_size) else {
+                        continue;
+                    };
+                    start = next_block;
+                }
+                let index = (start / subregion_size) % 8;
+
+                if start.checked_add(size).is_none_or(|end| end > window_end) {
+                    continue;
+                }
+
+                best = Some(if let Some(b) = best && (size, start) >= (b.size, b.start) {
+                    b
+                } else {
+                    RegionGeometry {
+                        start,
+                        size,
+                        block_start: start - (start % block_size),
+                        block_size,
+                        first_subregion: index,
+                        last_subregion: index + count - 1,
+                    }
+                });
+            }
+
+            let Some(next) = subregion_size.checked_mul(2) else {
+                break;
+            };
+            subregion_size = next;
+        }
+
+        best
     }
 }
 
@@ -460,110 +576,29 @@ unsafe impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
 
         let region_num = config.unused_region_number()?;
 
-        // Logical region
-        let mut start = unallocated_memory_start as usize;
-        let mut size = min_region_size;
+        // Region start always has to align to minimum region size bytes, and
+        // regions must be at least minimum region size bytes.
+        let window_start = (unallocated_memory_start as usize).next_multiple_of(MIN_REGION_SIZE);
+        let window_end =
+            (unallocated_memory_start as usize).checked_add(unallocated_memory_size)?;
+        let min_size = cmp::max(min_region_size, MIN_REGION_SIZE);
 
-        // Region start always has to align to minimum region size bytes
-        start = start.next_multiple_of(MIN_REGION_SIZE);
-
-        // Regions must be at least minimum region size bytes
-        if size < MIN_REGION_SIZE {
-            size = MIN_REGION_SIZE;
-        }
-
-        // Physical MPU region (might be larger than logical region if some subregions are disabled)
-        let mut region_start = start;
-        let mut region_size = size;
-        let mut subregions = None;
-
-        // We can only create an MPU region if the size is a power of two and it divides
-        // the start address. If this is not the case, the first thing we try to do to
-        // cover the memory region is to use a larger MPU region and expose certain subregions.
-        if size.count_ones() > 1 || !start.is_multiple_of(size) {
-            // Which (power-of-two) subregion size would align with the start
-            // address?
-            //
-            // We find this by taking smallest binary substring of the start
-            // address with exactly one bit:
-            //
-            //      1 << (start.trailing_zeros())
-            let subregion_size = {
-                let tz = start.trailing_zeros();
-                if tz < 32 {
-                    // Find the largest power of two that divides `start`
-                    1_usize << tz
-                } else {
-                    // This case means `start` is 0.
-                    let mut ceil = (size as u32).next_power_of_two() as usize;
-                    if ceil < 256 {
-                        ceil = 256
-                    }
-                    ceil / 8
-                }
-            };
-
-            // Once we have a subregion size, we get a region size by
-            // multiplying it by the number of subregions per region.
-            let underlying_region_size = subregion_size * 8;
-
-            // Finally, we calculate the region base by finding the nearest
-            // address below `start` that aligns with the region size.
-            let underlying_region_start = start - (start % underlying_region_size);
-
-            // If `size` doesn't align to the subregion size, extend it.
-            size = size.next_multiple_of(subregion_size);
-
-            let end = start + size;
-            let underlying_region_end = underlying_region_start + underlying_region_size;
-
-            // To use subregions, the region must be at least 256 bytes. Also, we need
-            // the amount of left over space in the region after `start` to be at least as
-            // large as the memory region we want to cover.
-            if subregion_size >= 32 && underlying_region_end >= end {
-                // The index of the first subregion to activate is the number of
-                // regions between `region_start` (MPU) and `start` (memory).
-                let min_subregion = (start - underlying_region_start) / subregion_size;
-
-                // The index of the last subregion to activate is the number of
-                // regions that fit in `len`, plus the `min_subregion`, minus one
-                // (because subregions are zero-indexed).
-                let max_subregion = min_subregion + size / subregion_size - 1;
-
-                region_start = underlying_region_start;
-                region_size = underlying_region_size;
-                subregions = Some((min_subregion, max_subregion));
-            } else {
-                // In this case, we can't use subregions to solve the alignment
-                // problem. Instead, we round up `size` to a power of two and
-                // shift `start` up in memory to make it align with `size`.
-                size = (size as u32).next_power_of_two() as usize;
-                start += size - (start % size);
-
-                region_start = start;
-                region_size = size;
-            }
-        }
-
-        // Check that our logical region fits in memory.
-        if start + size > (unallocated_memory_start as usize) + unallocated_memory_size {
-            return None;
-        }
+        let geometry = RegionGeometry::fit(window_start, window_end, min_size)?;
 
         let region = CortexMRegion::new(
-            start as *const u8,
-            size,
-            region_start as *const u8,
-            region_size,
+            geometry.start as *const u8,
+            geometry.size,
+            geometry.block_start as *const u8,
+            geometry.block_size,
             region_num,
-            subregions,
+            Some((geometry.first_subregion, geometry.last_subregion)),
             permissions,
         )?;
 
         config.regions[region_num] = region;
         config.is_dirty.set(true);
 
-        Some(mpu::Region::new(start as *const u8, size))
+        Some(mpu::Region::new(geometry.start as *const u8, geometry.size))
     }
 
     fn remove_memory_region(
@@ -805,5 +840,410 @@ unsafe impl<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize> mpu::MPU
             self.hardware_is_configured_for.set(config.id);
             config.is_dirty.set(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::platform::mpu::MPU as _;
+
+    /// Construct an `MPU` for testing.
+    ///
+    /// Region allocation is pure arithmetic over the config and never touches
+    /// the MMIO registers, but building an `MPU` still needs a `StaticRef` that
+    /// points at correctly aligned, live memory.
+    #[repr(align(4))]
+    struct FakeRegisters(#[allow(dead_code)] [u8; core::mem::size_of::<MpuRegisters>()]);
+    static FAKE_REGISTERS: FakeRegisters = FakeRegisters([0; core::mem::size_of::<MpuRegisters>()]);
+
+    fn mpu<const NUM_REGIONS: usize, const MIN_REGION_SIZE: usize>()
+    -> MPU<NUM_REGIONS, MIN_REGION_SIZE> {
+        let ptr = core::ptr::addr_of!(FAKE_REGISTERS).cast::<MpuRegisters>();
+        // SAFETY: the registers are never dereferenced by the methods under
+        // test, and the pointer is aligned and points at live memory.
+        unsafe { MPU::new(StaticRef::new(ptr)) }
+    }
+
+    /// Decode what was actually programmed into a hardware region: the block
+    /// base, the block size, and the subregion-disable mask.
+    fn decode(region: &CortexMRegion) -> (usize, usize, u8) {
+        let rbar = region.base_address().value;
+        let rasr = region.attributes().value;
+        assert_eq!(rasr & 1, 1, "region should be enabled");
+        let base = (rbar & !0x1f) as usize;
+        let block_size = 1_usize << (((rasr >> 1) & 0x1f) + 1);
+        let srd = ((rasr >> 8) & 0xff) as u8;
+        (base, block_size, srd)
+    }
+
+    /// The exact range of bytes a programmed region grants access to.
+    ///
+    /// Panics if the enabled subregions are not a single contiguous run, which
+    /// would mean the region grants access to a gap it should not.
+    fn granted(region: &CortexMRegion) -> (usize, usize) {
+        let (base, block_size, srd) = decode(region);
+        let granule = block_size / 8;
+        let (mut lo, mut hi) = (None, 0);
+        for i in 0..8 {
+            if (srd >> i) & 1 == 0 {
+                let start = base + i * granule;
+                match lo {
+                    None => lo = Some(start),
+                    Some(_) => assert_eq!(hi, start, "enabled subregions must be contiguous"),
+                }
+                hi = start + granule;
+            }
+        }
+        (lo.expect("at least one subregion must be enabled"), hi)
+    }
+
+    /// Independent model of what one ARMv7-M region can express.
+    ///
+    /// Derived from the hardware rules rather than from the allocator: a block
+    /// is a power-of-two size, aligned to itself, holding eight subregions;
+    /// blocks below 256 bytes cannot use subregions at all.
+    fn expressible(start: usize, size: usize) -> bool {
+        let with_subregions = (5..=24).any(|j| {
+            let g = 1_usize << j;
+            start.is_multiple_of(g)
+                && size.is_multiple_of(g)
+                && size / g >= 1
+                && ((start / g) % 8) + size / g <= 8
+        });
+        let without_subregions = matches!(size, 32 | 64 | 128) && start.is_multiple_of(size);
+        with_subregions || without_subregions
+    }
+
+    /// The smallest region of at least `min_size` bytes expressible inside
+    /// `[window_start, window_end)`, found by exhaustive search.
+    fn brute_force(window_start: usize, window_end: usize, min_size: usize) -> Option<usize> {
+        let mut best = None;
+        let mut start = window_start;
+        while start < window_end {
+            let mut size = min_size.next_multiple_of(CORTEXM_MIN_REGION_SIZE);
+            while start + size <= window_end {
+                if expressible(start, size) && best.is_none_or(|b| size < b) {
+                    best = Some(size);
+                }
+                size += CORTEXM_MIN_REGION_SIZE;
+            }
+            start += CORTEXM_MIN_REGION_SIZE;
+        }
+        best
+    }
+
+    /// The region geometry the allocator computed before Stage 1a, kept here as
+    /// a reference so we can assert the new allocator never rejects a layout
+    /// the old one accepted.
+    fn legacy_geometry(
+        unallocated_memory_start: usize,
+        unallocated_memory_size: usize,
+        min_region_size: usize,
+        min_region_size_const: usize,
+    ) -> Option<(usize, usize)> {
+        let mut start = unallocated_memory_start.next_multiple_of(min_region_size_const);
+        let mut size = core::cmp::max(min_region_size, min_region_size_const);
+
+        if size.count_ones() > 1 || !start.is_multiple_of(size) {
+            let subregion_size = {
+                let tz = start.trailing_zeros();
+                if tz < 32 {
+                    1_usize << tz
+                } else {
+                    core::cmp::max((size as u32).next_power_of_two() as usize, 256) / 8
+                }
+            };
+            let underlying_region_size = subregion_size * 8;
+            let underlying_region_start = start - (start % underlying_region_size);
+            size = size.next_multiple_of(subregion_size);
+
+            if subregion_size >= 32
+                && underlying_region_start + underlying_region_size >= start + size
+            {
+                // covered by subregions
+            } else {
+                size = (size as u32).next_power_of_two() as usize;
+                start += size - (start % size);
+            }
+        }
+
+        (start + size <= unallocated_memory_start + unallocated_memory_size)
+            .then_some((start, size))
+    }
+
+    fn alloc<const N: usize, const MIN: usize>(
+        m: &MPU<N, MIN>,
+        config: &mut CortexMConfig<N>,
+        start: usize,
+        window: usize,
+        min_size: usize,
+    ) -> Option<mpu::Region> {
+        m.allocate_region(
+            start as *const u8,
+            window,
+            min_size,
+            mpu::Permissions::ReadExecuteOnly,
+            config,
+        )
+    }
+
+    // ---- property tests -------------------------------------------------
+
+    /// Whenever a single region can cover the request, the allocator finds one,
+    /// and the one it finds is the smallest such region.
+    #[test]
+    fn allocator_is_complete_and_minimal() {
+        let m = mpu::<8, 32>();
+        let mut checked = 0;
+        for window_start in (0x1000..0x1000 + 2048).step_by(32) {
+            for window in (32..2048).step_by(96) {
+                for min_size in (32..1024).step_by(160) {
+                    let mut config = m.new_config().unwrap();
+                    let got = alloc(&m, &mut config, window_start, window, min_size);
+                    let want = brute_force(window_start, window_start + window, min_size);
+                    assert_eq!(
+                        got.map(|r| r.size()),
+                        want,
+                        "window {window_start:#x}+{window}, min_size {min_size}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000);
+    }
+
+    /// Every allocation grants exactly the range it reports back.
+    ///
+    /// No more and no less. An off-by-one in the subregion mask would hand a
+    /// process bytes belonging to its neighbour, so this is the invariant that
+    /// actually matters.
+    #[test]
+    fn allocation_grants_exactly_the_reported_range() {
+        let m = mpu::<8, 32>();
+        for window_start in [0x0, 0x20, 0x1000, 0x8020, 0x7_0000, 0x1234 * 32] {
+            for window in (32..8192).step_by(64) {
+                for min_size in (32..4096).step_by(224) {
+                    let mut config = m.new_config().unwrap();
+                    let Some(region) = alloc(&m, &mut config, window_start, window, min_size)
+                    else {
+                        continue;
+                    };
+                    let start = region.start_address() as usize;
+
+                    assert!(region.size() >= min_size, "granted less than requested");
+                    assert!(start >= window_start, "region starts before the window");
+                    assert!(
+                        start + region.size() <= window_start + window,
+                        "region runs past the window"
+                    );
+                    assert_eq!(
+                        granted(&config.regions[2]),
+                        (start, start + region.size()),
+                        "hardware grants a different range than was reported"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Stage 1a must only ever widen what loads: anything the previous
+    /// allocator accepted must still be accepted.
+    #[test]
+    fn no_regression_against_previous_allocator() {
+        let m = mpu::<8, 32>();
+        let mut legacy_ok = 0;
+        for window_start in (0x0..0x4000).step_by(160) {
+            for window in (32..4096).step_by(96) {
+                for min_size in (32..2048).step_by(160) {
+                    let Some((legacy_start, legacy_size)) =
+                        legacy_geometry(window_start, window, min_size, 32)
+                    else {
+                        continue;
+                    };
+                    legacy_ok += 1;
+                    let mut config = m.new_config().unwrap();
+                    let got = alloc(&m, &mut config, window_start, window, min_size)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "regression: legacy allocator produced {legacy_start:#x}+\
+                                 {legacy_size} for window {window_start:#x}+{window} \
+                                 min_size {min_size}, new allocator refused"
+                            )
+                        });
+                    assert!(
+                        got.size() <= legacy_size,
+                        "new allocator granted more than the legacy one"
+                    );
+                }
+            }
+        }
+        assert!(
+            legacy_ok > 500,
+            "legacy reference never succeeded; test is vacuous"
+        );
+    }
+
+    // ---- specific behaviours --------------------------------------------
+
+    /// A 96 KiB process binary at a 64 KiB-aligned address.
+    ///
+    /// Three subregions of 32 KiB express this exactly, but the previous
+    /// allocator derived the subregion size solely from the start address,
+    /// rounded 96 KiB up to 128 KiB, overran the window and gave up.
+    #[test]
+    fn flash_region_with_odd_part_three() {
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        let (start, len) = (0x1_0000, 96 * 1024);
+
+        assert!(
+            legacy_geometry(start, len, len, 32).is_none(),
+            "should regress"
+        );
+
+        let region = alloc(&m, &mut config, start, len, len).expect("should allocate");
+        assert_eq!(region.start_address() as usize, start);
+        assert_eq!(region.size(), len);
+        assert_eq!(granted(&config.regions[2]), (start, start + len));
+
+        let (base, block_size, srd) = decode(&config.regions[2]);
+        assert_eq!((base, block_size), (0x0, 256 * 1024));
+        // 96 KiB starting 64 KiB into a 256 KiB block of 32 KiB subregions is
+        // subregions 2, 3 and 4; the rest are disabled.
+        assert_eq!(srd, 0b1110_0011, "subregions 2..=4 of a 256 KiB block");
+    }
+
+    /// A small IPC-style buffer inside a large, highly aligned window.
+    ///
+    /// The previous allocator picked a subregion size from the window's
+    /// alignment, which for a 512 MiB-aligned base meant trying to hand out
+    /// 512 MiB.
+    #[test]
+    fn small_buffer_in_large_aligned_window() {
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        let (base, window) = (0x2000_0000, 32 * 1024);
+
+        assert!(
+            legacy_geometry(base, window, 1000, 32).is_none(),
+            "should regress"
+        );
+
+        let region = alloc(&m, &mut config, base, window, 1000).expect("should allocate");
+        assert_eq!(region.start_address() as usize, base);
+        assert_eq!(region.size(), 1024, "smallest expressible size >= 1000");
+        assert_eq!(granted(&config.regions[2]), (base, base + 1024));
+    }
+
+    /// A naturally aligned power-of-two region still programs as one block with
+    /// every subregion enabled.
+    #[test]
+    fn naturally_aligned_power_of_two_is_unchanged() {
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        let len = 128 * 1024;
+        let region = alloc(&m, &mut config, 0x2_0000, len, len).expect("should allocate");
+
+        assert_eq!(region.size(), len);
+        let (base, block_size, srd) = decode(&config.regions[2]);
+        assert_eq!((base, block_size, srd), (0x2_0000, len, 0));
+    }
+
+    /// 128 KiB at 0x7_0000 straddles a block boundary no single region can
+    /// cross, so it still fails. This is the case Stage 1b exists to fix;
+    /// if this ever starts passing, the two-region work landed.
+    #[test]
+    fn single_region_still_cannot_straddle_a_block_boundary() {
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        let len = 128 * 1024;
+        assert!(alloc(&m, &mut config, 0x7_0000, len, len).is_none());
+        assert_eq!(brute_force(0x7_0000, 0x7_0000 + len, len), None);
+    }
+
+    /// The Cortex-M0+ start-alignment floor is honoured.
+    #[test]
+    fn respects_the_larger_minimum_region_size() {
+        let m = mpu::<8, 256>();
+        let mut config = m.new_config().unwrap();
+        let region = alloc(&m, &mut config, 0x1020, 4096, 64).expect("should allocate");
+        assert_eq!(region.start_address() as usize % 256, 0);
+        assert!(region.size() >= 256);
+    }
+
+    #[test]
+    fn rejects_requests_that_cannot_fit() {
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        assert!(alloc(&m, &mut config, 0x1000, 64, 128).is_none());
+        assert!(alloc(&m, &mut config, 0x1000, 0, 32).is_none());
+    }
+
+    // ---- Display ---------------------------------------------------------
+
+    struct Sink {
+        buf: [u8; 16384],
+        len: usize,
+    }
+
+    impl Sink {
+        fn new() -> Self {
+            Sink {
+                buf: [0; 16384],
+                len: 0,
+            }
+        }
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.buf[..self.len]).unwrap()
+        }
+    }
+
+    impl fmt::Write for Sink {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let b = s.as_bytes();
+            let n = core::cmp::min(b.len(), self.buf.len() - self.len);
+            self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+            self.len += n;
+            Ok(())
+        }
+    }
+
+    /// Subregion bounds are a property of the underlying block.
+    ///
+    /// The block is often larger than the logical region, so printing subregion
+    /// bounds relative to the logical region made the debug output wrong
+    /// whenever subregions were in use.
+    #[test]
+    fn display_reports_subregions_of_the_block() {
+        use fmt::Write;
+
+        let m = mpu::<8, 32>();
+        let mut config = m.new_config().unwrap();
+        let (start, len) = (0x1_0000, 96 * 1024);
+        alloc(&m, &mut config, start, len, len).unwrap();
+
+        let (base, block_size, _) = decode(&config.regions[2]);
+        assert_ne!(base, start, "test only meaningful when the block is offset");
+
+        let mut printed = Sink::new();
+        write!(printed, "{}", config).unwrap();
+
+        let mut needle = Sink::new();
+        write!(
+            needle,
+            "Sub-region 0: [{:#010X}:{:#010X}]",
+            base,
+            base + block_size / 8
+        )
+        .unwrap();
+
+        assert!(
+            printed.as_str().contains(needle.as_str()),
+            "expected {:?} in:\n{}",
+            needle.as_str(),
+            printed.as_str()
+        );
     }
 }
