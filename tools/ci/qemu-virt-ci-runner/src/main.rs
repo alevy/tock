@@ -3,7 +3,7 @@
 // Copyright Tock Contributors 2026.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -20,17 +20,6 @@ mod boards;
 // Override with --libtock-c <dir>.
 const LIBTOCK_C_DIR_DEFAULT: &str = "../../../../libtock-c";
 
-const QMP_PORT: u16 = 44444;
-const SERIAL_PORT: u16 = 44445;
-
-// Extra QEMU flags for CI: expose QMP control socket, serial over TCP, start paused.
-const QEMU_CMDLINE_EXTRA: &str = concat!(
-    "-qmp tcp:localhost:44444,server ",
-    "-chardev socket,id=serial0,host=localhost,port=44445,server=on ",
-    "-serial chardev:serial0 ",
-    "-S"
-);
-
 // Maximum time to wait for QEMU sockets to become available.
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,6 +27,34 @@ const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // as a polling interval inside expect_serial; the per-test serial timeout is
 // set independently on the serial socket inside expect_serial).
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct QemuPorts {
+    qmp: u16,
+    serial: u16,
+}
+
+impl QemuPorts {
+    fn allocate() -> Result<Self, String> {
+        let qmp_listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+        let serial_listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+        let ports = Self {
+            qmp: qmp_listener.local_addr().map_err(|e| e.to_string())?.port(),
+            serial: serial_listener
+                .local_addr()
+                .map_err(|e| e.to_string())?
+                .port(),
+        };
+        drop((qmp_listener, serial_listener));
+        Ok(ports)
+    }
+
+    fn qemu_cmdline_extra(&self) -> String {
+        format!(
+            "-qmp tcp:127.0.0.1:{},server -chardev socket,id=serial0,host=127.0.0.1,port={},server=on -serial chardev:serial0 -S",
+            self.qmp, self.serial
+        )
+    }
+}
 
 struct QemuInstance {
     child: Child,
@@ -64,8 +81,8 @@ impl QmpConnection {
     /// connection.  The caller must ensure the serial TCP connection is also
     /// established before calling `handshake()`, because QEMU will not send
     /// the QMP greeting until all chardev clients are connected.
-    fn connect() -> Result<Self, String> {
-        let stream = wait_for_tcp(QMP_PORT)?;
+    fn connect(port: u16) -> Result<Self, String> {
+        let stream = wait_for_tcp(port)?;
         let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
         Ok(QmpConnection { stream, reader })
     }
@@ -216,10 +233,11 @@ where
 
     // Spawn `make run` with the extra QEMU flags that expose control sockets.
     println!("Starting QEMU via `make run`...");
+    let ports = QemuPorts::allocate()?;
     let child = Command::new("make")
         .current_dir(board_dir)
         .arg("run")
-        .env("QEMU_CMDLINE_EXTRA", QEMU_CMDLINE_EXTRA)
+        .env("QEMU_CMDLINE_EXTRA", ports.qemu_cmdline_extra())
         .process_group(0)
         .spawn()
         .map_err(|e| format!("failed to spawn make run: {}", e))?;
@@ -229,12 +247,13 @@ where
     // work.  QEMU will not send the QMP greeting until every chardev socket
     // (i.e. the serial port socket) also has a client connected, so we must
     // establish both connections first.
-    println!("Waiting for QMP socket on port {}...", QMP_PORT);
-    let mut qmp = QmpConnection::connect().map_err(|e| format!("QMP connect failed: {}", e))?;
+    println!("Waiting for QMP socket on port {}...", ports.qmp);
+    let mut qmp =
+        QmpConnection::connect(ports.qmp).map_err(|e| format!("QMP connect failed: {}", e))?;
 
-    println!("Waiting for serial socket on port {}...", SERIAL_PORT);
+    println!("Waiting for serial socket on port {}...", ports.serial);
     let serial_stream =
-        wait_for_tcp(SERIAL_PORT).map_err(|e| format!("serial connect failed: {}", e))?;
+        wait_for_tcp(ports.serial).map_err(|e| format!("serial connect failed: {}", e))?;
     let mut serial_write = serial_stream
         .try_clone()
         .map_err(|e| format!("failed to clone serial stream: {}", e))?;
@@ -814,5 +833,19 @@ fn main() {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QemuPorts;
+
+    #[test]
+    fn qemu_ports_are_distinct_and_released() {
+        let ports = QemuPorts::allocate().unwrap();
+
+        assert_ne!(ports.qmp, ports.serial);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", ports.qmp)).is_ok());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", ports.serial)).is_ok());
     }
 }
