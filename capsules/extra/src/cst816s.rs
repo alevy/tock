@@ -212,7 +212,7 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> Cst816s<'a, I, A> {
                 buffer[0] = REG_IRQ_CTL;
                 buffer[1] = IRQ_CTL_VALUE;
                 self.state.set(State::ConfiguringIrq);
-                match self.i2c.write(buffer, 2) {
+                match self.i2c_write(buffer, 2) {
                     Ok(()) => self.start_i2c_timeout(),
                     Err((err, buffer)) => {
                         kernel::debug!("cst816s: cannot configure interrupts: {:?}", err);
@@ -228,7 +228,7 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> Cst816s<'a, I, A> {
     fn read_chip_id(&self, buffer: &'static mut [u8]) {
         buffer[0] = REG_CHIP_ID;
         self.state.set(State::ReadingChipId);
-        match self.i2c.write_read(buffer, 1, 1) {
+        match self.i2c_read_regs(buffer, 1) {
             Ok(()) => self.start_i2c_timeout(),
             Err((err, buffer)) => {
                 kernel::debug!("cst816s: cannot read chip ID: {:?}", err);
@@ -236,6 +236,33 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> Cst816s<'a, I, A> {
                 self.ready();
             }
         }
+    }
+
+    /// Write `len` bytes, powering the I2C device for the transfer (it is
+    /// disabled again in `command_complete`).
+    fn i2c_write(
+        &self,
+        buffer: &'static mut [u8],
+        len: usize,
+    ) -> Result<(), (i2c::Error, &'static mut [u8])> {
+        self.i2c.enable();
+        self.i2c
+            .write(buffer, len)
+            .inspect_err(|_| self.i2c.disable())
+    }
+
+    /// Write one register address, then read `read_len` bytes, powering the
+    /// I2C device for the transfer (it is disabled again in
+    /// `command_complete`).
+    fn i2c_read_regs(
+        &self,
+        buffer: &'static mut [u8],
+        read_len: usize,
+    ) -> Result<(), (i2c::Error, &'static mut [u8])> {
+        self.i2c.enable();
+        self.i2c
+            .write_read(buffer, 1, read_len)
+            .inspect_err(|_| self.i2c.disable())
     }
 
     fn start_i2c_timeout(&self) {
@@ -337,7 +364,7 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> gpio::Client for Cst816s<'a, I, A>
         // sends another one ~10ms later.
         self.buffer.take().map(|buffer| {
             buffer[0] = REG_GESTURE_ID;
-            if let Err((_err, buffer)) = self.i2c.write_read(buffer, 1, BUFFER_LEN) {
+            if let Err((_err, buffer)) = self.i2c_read_regs(buffer, BUFFER_LEN) {
                 self.buffer.replace(buffer);
             }
         });
@@ -346,6 +373,7 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> gpio::Client for Cst816s<'a, I, A>
 
 impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> i2c::I2CClient for Cst816s<'a, I, A> {
     fn command_complete(&self, buffer: &'static mut [u8], status: Result<(), i2c::Error>) {
+        self.i2c.disable();
         match self.state.get() {
             State::ConfiguringIrq => {
                 if let Err(err) = status {
@@ -451,6 +479,7 @@ mod tests {
     struct MockI2c {
         pending: TakeCell<'static, [u8]>,
         ops: RefCell<Vec<I2cOp>>,
+        enabled: Cell<bool>,
     }
 
     impl Default for MockI2c {
@@ -458,19 +487,26 @@ mod tests {
             MockI2c {
                 pending: TakeCell::empty(),
                 ops: RefCell::new(Vec::new()),
+                enabled: Cell::new(false),
             }
         }
     }
 
     impl<'a> i2c::I2CDevice<'a> for MockI2c {
-        fn enable(&self) {}
-        fn disable(&self) {}
+        fn enable(&self) {
+            self.enabled.set(true);
+        }
+        fn disable(&self) {
+            self.enabled.set(false);
+        }
         fn write_read(
             &self,
             data: &'static mut [u8],
             _write_len: usize,
             read_len: usize,
         ) -> Result<(), (i2c::Error, &'static mut [u8])> {
+            // A disabled I2C device never completes a transfer.
+            assert!(self.enabled.get(), "transfer on a disabled I2C device");
             self.ops.borrow_mut().push(I2cOp::WriteRead {
                 reg: data[0],
                 read_len,
@@ -483,6 +519,7 @@ mod tests {
             data: &'static mut [u8],
             _len: usize,
         ) -> Result<(), (i2c::Error, &'static mut [u8])> {
+            assert!(self.enabled.get(), "transfer on a disabled I2C device");
             self.ops.borrow_mut().push(I2cOp::Write {
                 reg: data[0],
                 value: data[1],
@@ -666,6 +703,8 @@ mod tests {
             let buffer = self.i2c.pending.take().expect("no pending I2C operation");
             buffer[..data.len()].copy_from_slice(data);
             self.dev.command_complete(buffer, status);
+            // Only powered while a transfer is in progress.
+            assert_eq!(self.i2c.enabled.get(), self.i2c.pending.is_some());
         }
 
         fn last_op(&self) -> I2cOp {
