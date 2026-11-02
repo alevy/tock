@@ -42,20 +42,18 @@ const BUTTON_PIN: Pin = Pin::P0_17;
 const I2C_TEMP_SDA_PIN: Pin = Pin::P1_15;
 const I2C_TEMP_SCL_PIN: Pin = Pin::P0_02;
 
-/// Touch panel controller (Hynitron CST816S).
-///
-/// TODO: these are taken from the Bangle.js 2 (an SMA Q3) pin assignments in
-/// Espruino and have not been verified against this hardware yet.
+/// Touch panel controller (Hynitron CST816S), as in Espruino's Bangle.js 2
+/// (an SMA Q3) board definition (`boards/BANGLEJS2.py`: D33-D36).
 const I2C_TOUCH_SDA_PIN: Pin = Pin::P1_01;
 const I2C_TOUCH_SCL_PIN: Pin = Pin::P1_02;
 const TOUCH_RST_PIN: Pin = Pin::P1_03;
 const TOUCH_INT_PIN: Pin = Pin::P1_04;
 
 // Battery voltage (through a voltage divider) is on P0.03, i.e., analog
-// input AIN1. It is exposed as ADC channel 0.
-//
-// TODO: taken from the Bangle.js 2 (an SMA Q3) pin assignments in Espruino;
-// not yet verified against this hardware.
+// input AIN1, as in Espruino's Bangle.js 2 board definition (D3). It is
+// exposed as ADC channel 0. With the default channel setup (gain 1/4,
+// reference VDD/4), samples are a fraction of VDD (scaled to 16 bits).
+// Espruino considers the battery full at 0.3144 * VDD (about 20600).
 
 // Constants related to the configuration of the 15.4 network stack; DEFAULT_EXT_SRC_MAC
 // should be replaced by an extended src address generated from device serial number
@@ -570,6 +568,9 @@ pub unsafe fn start() -> (
         nrf52840::i2c::TWI,
         AlarmHw
     ));
+    // The panel reports coordinates from 0 to ~160 (see Espruino's
+    // `TOUCH_DEVICE_RANGE`), scale them to the 176x176 screen.
+    cst816s.set_scaling(160, 176, 176);
 
     let touch = components::touch::TouchComponent::new(
         board_kernel,
