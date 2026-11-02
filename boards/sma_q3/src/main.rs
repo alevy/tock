@@ -42,6 +42,15 @@ const BUTTON_PIN: Pin = Pin::P0_17;
 const I2C_TEMP_SDA_PIN: Pin = Pin::P1_15;
 const I2C_TEMP_SCL_PIN: Pin = Pin::P0_02;
 
+/// Touch panel controller (Hynitron CST816S).
+///
+/// TODO: these are taken from the Bangle.js 2 (an SMA Q3) pin assignments in
+/// Espruino and have not been verified against this hardware yet.
+const I2C_TOUCH_SDA_PIN: Pin = Pin::P1_01;
+const I2C_TOUCH_SCL_PIN: Pin = Pin::P1_02;
+const TOUCH_RST_PIN: Pin = Pin::P1_03;
+const TOUCH_INT_PIN: Pin = Pin::P1_04;
+
 // Constants related to the configuration of the 15.4 network stack; DEFAULT_EXT_SRC_MAC
 // should be replaced by an extended src address generated from device serial number
 const SRC_MAC: u16 = 0xf00f;
@@ -101,6 +110,7 @@ type ConsoleDriver = components::console::ConsoleComponentType;
 type AnalogComparatorDriver =
     components::analog_comparator::AnalogComparatorComponentType<AnalogComparatorHw>;
 type ScreenDriver = components::screen::ScreenComponentType;
+type TouchDriver = capsules_extra::touch::Touch<'static>;
 
 kernel::define_capability_type!(ProcessConsoleCap:
     kernel::capabilities::ProcessManagementCapability,
@@ -125,6 +135,7 @@ pub struct Platform {
     analog_comparator: &'static AnalogComparatorDriver,
     alarm: &'static AlarmDriver,
     screen: &'static ScreenDriver,
+    touch: &'static TouchDriver,
     scheduler: &'static SchedulerInUse,
     systick: cortexm4::systick::SysTick,
 }
@@ -146,6 +157,7 @@ impl SyscallDriverLookup for Platform {
             capsules_extra::temperature::DRIVER_NUM => f(Some(self.temperature)),
             capsules_extra::analog_comparator::DRIVER_NUM => f(Some(self.analog_comparator)),
             capsules_extra::screen::screen::DRIVER_NUM => f(Some(self.screen)),
+            capsules_extra::touch::DRIVER_NUM => f(Some(self.touch)),
             kernel::ipc::DRIVER_NUM => f(Some(&self.ipc)),
             _ => f(None),
         }
@@ -525,6 +537,41 @@ pub unsafe fn start() -> (
         screen
     };
 
+    //--------------------------------------------------------------------------
+    // TOUCH PANEL
+    //--------------------------------------------------------------------------
+
+    // Hynitron CST816S on its own I2C bus. TWI0 shares its hardware with
+    // SPIM0, which this board does not use.
+    base_peripherals.twi0.configure(
+        nrf52840::pinmux::Pinmux::new(I2C_TOUCH_SCL_PIN),
+        nrf52840::pinmux::Pinmux::new(I2C_TOUCH_SDA_PIN),
+    );
+    let touch_i2c_bus = components::i2c::I2CMuxComponent::new(&base_peripherals.twi0, None)
+        .finalize(components::i2c_mux_component_static!(nrf52840::i2c::TWI));
+
+    let cst816s = components::cst816s::Cst816sComponent::new(
+        touch_i2c_bus,
+        capsules_extra::cst816s::I2C_ADDRESS,
+        &nrf52840_peripherals.gpio_port[TOUCH_INT_PIN],
+        Some(&nrf52840_peripherals.gpio_port[TOUCH_RST_PIN]),
+        mux_alarm,
+    )
+    .finalize(components::cst816s_component_static!(
+        nrf52840::i2c::TWI,
+        AlarmHw
+    ));
+
+    let touch = components::touch::TouchComponent::new(
+        board_kernel,
+        capsules_extra::touch::DRIVER_NUM,
+        cst816s,
+        Some(cst816s),
+        None,
+        create_capability!(capabilities::MemoryAllocationCapability),
+    )
+    .finalize(components::touch_component_static!());
+
     let platform = Platform {
         temperature,
         button,
@@ -538,6 +585,7 @@ pub unsafe fn start() -> (
         alarm,
         analog_comparator,
         screen,
+        touch,
         ipc: kernel::ipc::IPC::new(
             board_kernel,
             kernel::ipc::DRIVER_NUM,
