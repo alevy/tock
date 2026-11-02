@@ -1142,6 +1142,7 @@ dependencies = [
 name = "nrf5x"
 version = "0.2.4-dev"
 dependencies = [
+ "capsules-core",
  "enum_primitive",
  "kernel",
  "nrf5x-unsafe",
