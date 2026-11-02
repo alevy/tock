@@ -550,6 +550,19 @@ pub unsafe fn start() -> (
 
     // Hynitron CST816S on its own I2C bus. TWI0 shares its hardware with
     // SPIM0, which this board does not use.
+    //
+    // Configure the bus pins as the nRF52840 TWIM requires (input, S0D1
+    // drive), with the internal pull-ups enabled: Espruino uses them for this
+    // bus, which suggests that it has no external pull-ups, without which the
+    // bus is held low and transfers never complete.
+    for pin in [I2C_TOUCH_SDA_PIN, I2C_TOUCH_SCL_PIN] {
+        let pin = &nrf52840_peripherals.gpio_port[pin];
+        pin.set_i2c_pin_cfg();
+        kernel::hil::gpio::Configure::set_floating_state(
+            pin,
+            kernel::hil::gpio::FloatingState::PullUp,
+        );
+    }
     base_peripherals.twi0.configure(
         nrf52840::pinmux::Pinmux::new(I2C_TOUCH_SCL_PIN),
         nrf52840::pinmux::Pinmux::new(I2C_TOUCH_SDA_PIN),

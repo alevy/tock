@@ -73,6 +73,10 @@ const RESET_ASSERT_MS: u32 = 10;
 /// soon after reset.
 const RESET_BOOT_MS: u32 = 50;
 
+/// Report an error if an I2C transfer during initialization does not
+/// complete within this time (e.g., if the bus is held low).
+const I2C_TIMEOUT_MS: u32 = 100;
+
 /// Interrupt control register.
 const REG_IRQ_CTL: u8 = 0xFA;
 /// EnTouch (0x40): pulse periodically while touched; EnChange (0x20): pulse
@@ -208,10 +212,13 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> Cst816s<'a, I, A> {
                 buffer[0] = REG_IRQ_CTL;
                 buffer[1] = IRQ_CTL_VALUE;
                 self.state.set(State::ConfiguringIrq);
-                if let Err((err, buffer)) = self.i2c.write(buffer, 2) {
-                    kernel::debug!("cst816s: cannot configure interrupts: {:?}", err);
-                    self.buffer.replace(buffer);
-                    self.ready();
+                match self.i2c.write(buffer, 2) {
+                    Ok(()) => self.start_i2c_timeout(),
+                    Err((err, buffer)) => {
+                        kernel::debug!("cst816s: cannot configure interrupts: {:?}", err);
+                        self.buffer.replace(buffer);
+                        self.ready();
+                    }
                 }
             }
             None => self.ready(),
@@ -221,14 +228,24 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> Cst816s<'a, I, A> {
     fn read_chip_id(&self, buffer: &'static mut [u8]) {
         buffer[0] = REG_CHIP_ID;
         self.state.set(State::ReadingChipId);
-        if let Err((err, buffer)) = self.i2c.write_read(buffer, 1, 1) {
-            kernel::debug!("cst816s: cannot read chip ID: {:?}", err);
-            self.buffer.replace(buffer);
-            self.ready();
+        match self.i2c.write_read(buffer, 1, 1) {
+            Ok(()) => self.start_i2c_timeout(),
+            Err((err, buffer)) => {
+                kernel::debug!("cst816s: cannot read chip ID: {:?}", err);
+                self.buffer.replace(buffer);
+                self.ready();
+            }
         }
     }
 
+    fn start_i2c_timeout(&self) {
+        self.alarm
+            .set_alarm(self.alarm.now(), self.alarm.ticks_from_ms(I2C_TIMEOUT_MS));
+    }
+
     fn ready(&self) {
+        // Cancel any initialization timeout.
+        let _ = self.alarm.disarm();
         self.state.set(State::Ready);
         self.interrupt_pin
             .enable_interrupts(gpio::InterruptEdge::FallingEdge);
@@ -376,7 +393,15 @@ impl<'a, I: i2c::I2CDevice<'a>, A: Alarm<'a>> AlarmClient for Cst816s<'a, I, A> 
             State::Booting => self.configure(),
             // Release timeout.
             State::Ready => self.release(),
-            State::Uninitialized | State::ConfiguringIrq | State::ReadingChipId => {}
+            State::ConfiguringIrq | State::ReadingChipId => {
+                // The transfer is still in progress, and the I2C HIL offers
+                // no way to abort it: report it, the driver cannot proceed.
+                kernel::debug!(
+                    "cst816s: I2C transfer did not complete within {}ms; is the bus held low (missing pull-ups on SDA/SCL)?",
+                    I2C_TIMEOUT_MS
+                );
+            }
+            State::Uninitialized => {}
         }
     }
 }
@@ -734,6 +759,22 @@ mod tests {
         touch::Touch::enable(f.dev).unwrap();
         f.report(0, 1, 2, 10, 20);
         assert_eq!(f.touches(), [("pressed", 10, 20)]);
+    }
+
+    #[test]
+    fn stuck_i2c_transfer_times_out() {
+        let f = Fixture::new();
+        f.dev.init();
+        f.fire_alarm();
+        f.fire_alarm();
+        // The interrupt control register write never completes.
+        f.fire_alarm();
+        assert!(f.int.interrupts.get().is_none());
+        // Should it eventually complete, initialization resumes.
+        f.complete_i2c(&[], Ok(()));
+        f.complete_i2c(&[0xB5], Ok(()));
+        assert!(f.int.interrupts.get().is_some());
+        assert!(f.alarm.armed.get().is_none(), "timeout cancelled");
     }
 
     #[test]
