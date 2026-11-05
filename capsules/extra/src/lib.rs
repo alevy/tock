@@ -33,6 +33,7 @@ pub mod can;
 pub mod ccs811;
 pub mod chirp_i2c_moisture;
 pub mod crc;
+pub mod cst816s;
 pub mod cycle_count;
 pub mod cyw4343;
 pub mod dac;

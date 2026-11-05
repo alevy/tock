@@ -64,6 +64,11 @@ const TIMER1_BASE: StaticRef<crate::timer::TimerRegisters> =
 const TIMER2_BASE: StaticRef<crate::timer::TimerRegisters> =
     unsafe { StaticRef::new(0x4000A000 as *const crate::timer::TimerRegisters) };
 
+// TWI0 shares its base address (and interrupt) with SPIM0: only one of them
+// can be enabled at a time.
+const TWI0_BASE: StaticRef<crate::i2c::TwiRegisters> =
+    unsafe { StaticRef::new(0x40003000 as *const crate::i2c::TwiRegisters) };
+
 const TWI1_BASE: StaticRef<crate::i2c::TwiRegisters> =
     unsafe { StaticRef::new(0x40004000 as *const crate::i2c::TwiRegisters) };
 
@@ -110,6 +115,8 @@ pub struct Nrf52DefaultPeripherals<'a> {
     pub timer2: crate::timer::Timer,
     pub uarte0: crate::uarte::Uarte<'a>,
     pub spim0: crate::spi::SPIM<'a>,
+    /// Shares its hardware with `spim0`: a board may use one or the other.
+    pub twi0: crate::i2c::TWI<'a>,
     pub twi1: crate::i2c::TWI<'a>,
     pub spim2: crate::spi::SPIM<'a>,
     pub adc: crate::adc::Adc<'a>,
@@ -154,6 +161,7 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
             timer2: crate::timer::Timer::new(TIMER2_BASE),
             uarte0: crate::uarte::Uarte::new(uarte0_registers),
             spim0: crate::spi::SPIM::new(SPIM0_BASE),
+            twi0: crate::i2c::TWI::new(TWI0_BASE),
             spim2: crate::spi::SPIM::new(SPIM2_BASE),
             twi1: crate::i2c::TWI::new(TWI1_BASE),
             // Default to 3.3 V VDD reference.
@@ -188,7 +196,15 @@ impl kernel::platform::chip::InterruptService for Nrf52DefaultPeripherals<'_> {
             crate::peripheral_interrupts::TIMER1 => self.timer1.handle_interrupt(),
             crate::peripheral_interrupts::TIMER2 => self.timer2.handle_interrupt(),
             crate::peripheral_interrupts::UART0 => self.uarte0.handle_interrupt(),
-            crate::peripheral_interrupts::SPI0_TWI0 => self.spim0.handle_interrupt(),
+            crate::peripheral_interrupts::SPI0_TWI0 => {
+                // SPIM0 and TWI0 share the same hardware, dispatch to
+                // whichever is enabled.
+                if self.twi0.is_enabled() {
+                    self.twi0.handle_interrupt()
+                } else {
+                    self.spim0.handle_interrupt()
+                }
+            }
             crate::peripheral_interrupts::SPI1_TWI1 => self.twi1.handle_interrupt(),
             crate::peripheral_interrupts::SPIM2_SPIS2_SPI2 => self.spim2.handle_interrupt(),
             crate::peripheral_interrupts::ADC => self.adc.handle_interrupt(),

@@ -13,6 +13,9 @@ nrf5x-unsafe = { path = "../nrf5x-unsafe" }
 kernel = { path = "../../kernel" }
 enum_primitive = { path = "../../libraries/enum_primitive" }
 
+[dev-dependencies]
+capsules-core = { path = "../../capsules/core" }
+
 [features]
 default = []
 
