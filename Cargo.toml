@@ -65,6 +65,7 @@ members = [
     "boards/qemu_rv32_virt",
     "boards/qemu_rv64_virt",
     "boards/weact_f401ccu6/",
+    "boards/configurations/nrf52840dk/nrf52840dk-ble-peripheral",
     "boards/configurations/nrf52840dk/nrf52840dk-test-appid-ecdsap256",
     "boards/configurations/nrf52840dk/nrf52840dk-test-appid-sha256",
     "boards/configurations/nrf52840dk/nrf52840dk-test-appid-tbf",
