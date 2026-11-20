@@ -84,6 +84,8 @@ Support for wireless radios, network stacks and related infrastructure.
 - **[RF233](src/rf233.rs)**: Driver for RF233 radio.
 - **[BLE Advertising](src/ble_advertising_driver.rs)**: Driver for sending BLE
   advertisements.
+- **[BLE Connections](src/ble_connection)**: BLE link layer connections,
+  peripheral role.
 - **[LoRa Phy]**: Support for exposing Semtech devices to userspace
   See the lora_things_plus board for an example
 - **[Ethernet Tap Driver](src/ethernet_tap.rs)**: Forwarding raw IEEE
