@@ -35,24 +35,28 @@ use tock_registers_v0::interfaces::{Readable, Writeable};
 use tock_registers_v0::registers::{ReadWrite, WriteOnly};
 use tock_registers_v0::{register_bitfields, register_structs};
 
+// Some registers are public because the nRF52 BLE radio driver drives TIMER0
+// itself during a connection event: the inter-frame turnaround is built from
+// PPI channels that are hardwired to this timer, so it cannot go through the
+// `Alarm` interface. See `chips/nrf52/src/ble_radio.rs`.
 register_structs! {
     pub TimerRegisters {
         /// Start Timer
-        (0x000 => tasks_start: WriteOnly<u32, Task::Register>),
+        (0x000 => pub tasks_start: WriteOnly<u32, Task::Register>),
         /// Stop Timer
-        (0x004 => tasks_stop: WriteOnly<u32, Task::Register>),
+        (0x004 => pub tasks_stop: WriteOnly<u32, Task::Register>),
         /// Increment Timer (Counter mode only)
         (0x008 => tasks_count: WriteOnly<u32, Task::Register>),
         /// Clear time
-        (0x00C => tasks_clear: WriteOnly<u32, Task::Register>),
+        (0x00C => pub tasks_clear: WriteOnly<u32, Task::Register>),
         /// Shut down timer
         (0x010 => tasks_shutdown: WriteOnly<u32, Task::Register>),
         (0x014 => _reserved0: [u8; 44]),
         /// Capture Timer value
-        (0x040 => tasks_capture: [WriteOnly<u32, Task::Register>; 4]),
+        (0x040 => pub tasks_capture: [WriteOnly<u32, Task::Register>; 4]),
         (0x050 => _reserved1: [u8; 240]),
         /// Compare event
-        (0x140 => events_compare: [ReadWrite<u32, Event::Register>; 4]),
+        (0x140 => pub events_compare: [ReadWrite<u32, Event::Register>; 4]),
         (0x150 => _reserved2: [u8; 176]),
         /// Shortcut register
         (0x200 => shorts: ReadWrite<u32, Shorts::Register>),
@@ -65,13 +69,13 @@ register_structs! {
         /// Timer mode selection
         (0x504 => mode: ReadWrite<u32>),
         /// Configure the number of bits used by the TIMER
-        (0x508 => bitmode: ReadWrite<u32, Bitmode::Register>),
+        (0x508 => pub bitmode: ReadWrite<u32, Bitmode::Register>),
         (0x50C => _reserved5: [u8; 4]),
         /// Timer prescaler register
-        (0x510 => prescaler: ReadWrite<u32>),
+        (0x510 => pub prescaler: ReadWrite<u32>),
         (0x514 => _reserved6: [u8; 44]),
         /// Capture/Compare
-        (0x540 => cc: [ReadWrite<u32, CC::Register>; 4]),
+        (0x540 => pub cc: [ReadWrite<u32, CC::Register>; 4]),
         (0x550 => @END),
     }
 }
@@ -177,7 +181,7 @@ register_bitfields![u32,
         /// Write '1' to Enable interrupt on EVENTS_COMPARE\[5\] event
         COMPARE5 21
     ],
-    Bitmode [
+    pub Bitmode [
         /// Timer bit width
         BITMODE OFFSET(0) NUMBITS(2) [
             Bit16 = 0,
@@ -186,13 +190,13 @@ register_bitfields![u32,
             Bit32 = 3
         ]
     ],
-    Task [
+    pub Task [
         ENABLE 0
     ],
-    Event [
+    pub Event [
         READY 0
     ],
-    CC [
+    pub CC [
         CC OFFSET(0) NUMBITS(32)
     ]
 ];

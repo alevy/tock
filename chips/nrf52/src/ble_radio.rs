@@ -38,16 +38,22 @@
 //!
 //! * CRC - 3 bytes
 
+use crate::ppi::{Channel, Ppi, PpiRegisters};
 use core::cell::Cell;
 use core::ptr::addr_of;
 use core::ptr::addr_of_mut;
 use kernel::ErrorCode;
 use kernel::hil::ble_advertising;
 use kernel::hil::ble_advertising::RadioChannel;
+use kernel::hil::ble_connection::{
+    BleConnectionDriver, ConnectionEventClient, ConnectionParams, TxPdu,
+};
+use kernel::hil::time::{Freq1MHz, Ticks, Ticks32, Time};
 use kernel::utilities::StaticRef;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::cells::TakeCell;
 use nrf5x::constants::TxPower;
+use nrf5x::timer::TimerRegisters;
 use tock_registers_v0::interfaces::{Readable, Writeable};
 use tock_registers_v0::registers::{ReadOnly, ReadWrite, WriteOnly};
 use tock_registers_v0::{register_bitfields, register_structs};
@@ -470,22 +476,126 @@ register_bitfields! [u32,
 static mut PAYLOAD: [u8; nrf5x::constants::RADIO_PAYLOAD_LENGTH] =
     [0x00; nrf5x::constants::RADIO_PAYLOAD_LENGTH];
 
+// ---------------------------------------------------------------------------
+// Connection event timing.
+//
+// A connection event is driven almost entirely by hardware, because the reply
+// to the central's packet is due exactly T_IFS = 150 us after it arrives. The
+// CPU only arms the sequence beforehand and adjusts two header bits partway
+// through; see `connection_event_start` and `handle_interrupt`.
+//
+// The sequence uses TIMER0 and three PPI channels:
+//
+//   CC[0]  open time       PPI ch 21 (fixed):       TIMER0 COMPARE[0] -> RADIO RXEN
+//   CC[1]  anchor capture  PPI ch 26 (fixed):       RADIO ADDRESS -> TIMER0 CAPTURE[1]
+//   CC[2]  window timeout  PPI ch 0 (programmed):   TIMER0 COMPARE[2] -> RADIO DISABLE
+//   CC[3]  software reads of the current time
+//
+// Channels 21 and 26 are pre-programmed in hardware and are the reason this
+// driver uses TIMER0 specifically rather than any free timer.
+// ---------------------------------------------------------------------------
+
+/// Index of the capture/compare register holding a connection event's open time.
+const CC_OPEN_TIME: usize = 0;
+/// Index of the capture/compare register that hardware stamps with the anchor point.
+const CC_ANCHOR: usize = 1;
+/// Index of the capture/compare register holding the receive window deadline.
+const CC_WINDOW_TIMEOUT: usize = 2;
+/// Index of the capture/compare register used to read the current time.
+const CC_NOW: usize = 3;
+
+/// Programmable PPI channel routing the window timeout to `RADIO.TASKS_DISABLE`.
+const PPI_CH_WINDOW_TIMEOUT: usize = 0;
+
+/// TIMER0 prescaler giving a 1 MHz tick: 16 MHz / 2^4.
+const TIMER_PRESCALER_1MHZ: u32 = 4;
+
+/// How long to keep receiving before giving up on the central, in microseconds.
+///
+/// Generous relative to the window widening the client applies; it exists so a
+/// connection event always ends, not to bound the window precisely.
+const RX_WINDOW_TIMEOUT_US: u32 = 2000;
+
+/// Inter-frame space between a received packet and its reply, in microseconds.
+///
+/// Bluetooth Core Specification, Vol 6, Part B, Section 4.1.1.
+const T_IFS_US: u32 = 150;
+
+/// Link-layer header bit positions, Bluetooth Core Specification, Vol 6, Part B,
+/// Section 2.4.
+mod ll_header {
+    /// Next expected sequence number.
+    pub const NESN: u8 = 2;
+    /// Sequence number.
+    pub const SN: u8 = 3;
+    /// Mask covering both sequence number bits.
+    pub const SEQ_MASK: u8 = (1 << NESN) | (1 << SN);
+    /// LLID value for an empty PDU.
+    pub const LLID_EMPTY: u8 = 0b01;
+}
+
+/// Phase of an in-progress connection event.
+#[derive(Copy, Clone, PartialEq)]
+enum ConnPhase {
+    /// No connection event in progress.
+    Idle,
+    /// Receiving the central's packet.
+    Rx,
+    /// Transmitting the reply, which hardware started via a shortcut.
+    Tx,
+}
+
 pub struct Radio<'a> {
     registers: StaticRef<RadioRegisters>,
+    /// TIMER0, used only for connection event timing.
+    timer: StaticRef<TimerRegisters>,
+    ppi: Ppi,
     tx_power: Cell<TxPower>,
     rx_client: OptionalCell<&'a dyn ble_advertising::RxClient>,
     tx_client: OptionalCell<&'a dyn ble_advertising::TxClient>,
     buffer: TakeCell<'static, [u8]>,
+    conn_client: OptionalCell<&'a dyn ConnectionEventClient<Ticks32>>,
+    conn_tx_buf: TakeCell<'static, [u8]>,
+    conn_phase: Cell<ConnPhase>,
+    /// Parameters of the current connection; `None` until configured.
+    conn_params: Cell<Option<ConnectionParams>>,
+    conn_rx_ok: Cell<bool>,
+    conn_anchor: Cell<u32>,
+    /// Our transmit sequence number, one bit.
+    conn_sn: Cell<u8>,
+    /// The sequence number we expect from the central next, one bit.
+    conn_nesn: Cell<u8>,
+    /// Whether the central acknowledged the packet we sent in the previous
+    /// connection event. Reset at the start of each event.
+    conn_tx_acked: Cell<bool>,
+    /// What the client said about the payload currently loaded for transmission.
+    conn_tx_pdu: Cell<TxPdu>,
 }
 
 impl<'a> Radio<'a> {
-    pub const fn new(registers: StaticRef<RadioRegisters>) -> Radio<'a> {
+    pub const fn new(
+        registers: StaticRef<RadioRegisters>,
+        timer: StaticRef<TimerRegisters>,
+        ppi: StaticRef<PpiRegisters>,
+    ) -> Radio<'a> {
         Radio {
             registers,
+            timer,
+            ppi: Ppi::new(ppi),
             tx_power: Cell::new(TxPower::ZerodBm),
             rx_client: OptionalCell::empty(),
             tx_client: OptionalCell::empty(),
             buffer: TakeCell::empty(),
+            conn_client: OptionalCell::empty(),
+            conn_tx_buf: TakeCell::empty(),
+            conn_phase: Cell::new(ConnPhase::Idle),
+            conn_params: Cell::new(None),
+            conn_rx_ok: Cell::new(false),
+            conn_anchor: Cell::new(0),
+            conn_sn: Cell::new(0),
+            conn_nesn: Cell::new(0),
+            conn_tx_acked: Cell::new(false),
+            conn_tx_pdu: Cell::new(TxPdu::Stale),
         }
     }
 
@@ -536,6 +646,11 @@ impl<'a> Radio<'a> {
     #[inline(never)]
     pub fn handle_interrupt(&self) {
         self.disable_all_interrupts();
+
+        if self.conn_phase.get() != ConnPhase::Idle {
+            self.handle_connection_interrupt();
+            return;
+        }
 
         if self.registers.event_ready.is_set(Event::READY) {
             self.registers.event_ready.write(Event::READY::CLEAR);
@@ -727,6 +842,209 @@ impl<'a> Radio<'a> {
     fn ble_set_tx_power(&self) {
         self.set_tx_power();
     }
+    /// Service a radio interrupt belonging to a connection event.
+    ///
+    /// Two `DISABLED` interrupts arrive per event. After the reception, the
+    /// radio is already ramping up to transmit (the `DISABLED_TXEN` shortcut),
+    /// which leaves roughly 40 us to stamp the acknowledgement bits into the
+    /// reply and point the radio at it. After the transmission, the event is
+    /// over and the client is notified.
+    fn handle_connection_interrupt(&self) {
+        // The anchor point is captured by hardware on the access address; read
+        // it out once the packet has finished arriving.
+        if self.registers.event_end.is_set(Event::READY) && self.conn_phase.get() == ConnPhase::Rx {
+            self.registers.event_end.write(Event::READY::CLEAR);
+            self.conn_rx_ok
+                .set(self.registers.crcstatus.is_set(Event::READY));
+            self.conn_anchor.set(self.timer.cc[CC_ANCHOR].get());
+        }
+
+        if !self.registers.event_disabled.is_set(Event::READY) {
+            // Nothing to do yet; wait for the next edge.
+            self.registers
+                .intenset
+                .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+            return;
+        }
+        self.registers.event_disabled.write(Event::READY::CLEAR);
+
+        match self.conn_phase.get() {
+            ConnPhase::Rx => self.finish_connection_rx(),
+            ConnPhase::Tx => self.finish_connection_tx(),
+            ConnPhase::Idle => {}
+        }
+    }
+
+    /// Reception is done and the reply is ramping up.
+    ///
+    /// Updates the link-layer sequence numbers from the packet just received
+    /// and stamps them into the reply, so that the acknowledgement the central
+    /// sees refers to that packet. See Bluetooth Core Specification, Vol 6,
+    /// Part B, Section 4.5.9.
+    fn finish_connection_rx(&self) {
+        // A corrupt or absent packet must not advance the sequence numbers.
+        if self.conn_rx_ok.get() {
+            // ### Safety
+            //
+            // `PAYLOAD` is the radio's receive buffer. The packet finished
+            // arriving before the `END` event handled above, so the DMA engine
+            // is no longer writing to it, and this interrupt handler is the
+            // only reader.
+            let rx_hdr = unsafe { (*addr_of!(PAYLOAD))[0] };
+            let rx_nesn = (rx_hdr >> ll_header::NESN) & 1;
+            let rx_sn = (rx_hdr >> ll_header::SN) & 1;
+
+            // The central acknowledged our packet if its next-expected
+            // sequence number moved past our sequence number.
+            if rx_nesn != self.conn_sn.get() {
+                self.conn_sn.set(rx_nesn);
+                self.conn_tx_acked.set(true);
+            }
+            // A packet that is not a retransmission carries the sequence
+            // number we were expecting; acknowledge it.
+            if rx_sn == self.conn_nesn.get() {
+                self.conn_nesn.set(self.conn_nesn.get() ^ 1);
+            }
+        }
+
+        let sn = self.conn_sn.get();
+        let nesn = self.conn_nesn.get();
+        let suppress = self.conn_tx_acked.get() && self.conn_tx_pdu.get() == TxPdu::Stale;
+        if let Some(ptr) = self.conn_tx_buf.map(|b| {
+            // Retransmitting an acknowledged payload under an advanced
+            // sequence number would read to the central as a new, duplicate
+            // packet. Send an empty PDU instead. A payload that has never been
+            // transmitted is exempt: it has to go out regardless.
+            if suppress && b.len() >= 2 {
+                b[0] = ll_header::LLID_EMPTY;
+                b[1] = 0;
+            }
+            b[0] =
+                (b[0] & !ll_header::SEQ_MASK) | (nesn << ll_header::NESN) | (sn << ll_header::SN);
+            b.as_ptr() as u32
+        }) {
+            self.registers.packetptr.set(ptr);
+        }
+
+        // Drop DISABLED_TXEN so that finishing the transmission does not start
+        // another one.
+        self.registers
+            .shorts
+            .write(Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET);
+        // The receive window is over either way, so the timeout is moot.
+        self.ppi.disable(Channel::CH0::SET);
+        self.conn_phase.set(ConnPhase::Tx);
+        self.registers
+            .intenset
+            .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+    }
+
+    /// The reply has gone out; tear down and report the event.
+    fn finish_connection_tx(&self) {
+        self.ppi.disable(Channel::CH21::SET + Channel::CH26::SET);
+        self.registers.shorts.write(Shortcut::READY_START::CLEAR);
+        self.conn_phase.set(ConnPhase::Idle);
+        self.radio_off();
+
+        let result = if self.conn_rx_ok.get() {
+            Ok(())
+        } else {
+            Err(ErrorCode::FAIL)
+        };
+        let anchor = Ticks32::from(self.conn_anchor.get());
+        let acked = self.conn_tx_acked.get();
+
+        if let Some(tx_buf) = self.conn_tx_buf.take() {
+            self.conn_client.map(|client| {
+                // ### Safety
+                //
+                // `PAYLOAD` is the radio's receive buffer. The radio is powered
+                // off above, so no DMA is in flight, and the shared reference
+                // does not outlive this call.
+                let rx = unsafe { &*addr_of!(PAYLOAD) };
+                client.connection_event_done(rx, tx_buf, result, anchor, acked);
+            });
+        }
+    }
+
+    /// Start TIMER0 as a free-running 1 MHz counter.
+    fn connection_timer_init(&self) {
+        self.timer.tasks_stop.set(1);
+        self.timer.prescaler.set(TIMER_PRESCALER_1MHZ);
+        self.timer
+            .bitmode
+            .set(nrf5x::timer::BitmodeValue::Size32Bits as u32);
+        self.timer.tasks_clear.set(1);
+        self.timer.tasks_start.set(1);
+    }
+
+    /// Address of a TIMER0 compare event register, for use as a PPI endpoint.
+    fn timer_compare_event_address(&self, index: usize) -> u32 {
+        core::ptr::from_ref(&self.timer.events_compare[index]) as u32
+    }
+
+    /// Address of the radio's disable task register, for use as a PPI endpoint.
+    fn radio_disable_task_address(&self) -> u32 {
+        core::ptr::from_ref(&self.registers.task_disable) as u32
+    }
+
+    /// Apply the radio configuration that stays fixed for a connection event.
+    ///
+    /// The radio is power-cycled at the start of every event, which resets its
+    /// registers, so this runs once per event rather than once per connection.
+    fn configure_connection_radio(&self, params: &ConnectionParams, channel: RadioChannel) {
+        // Access address: BALEN=3 puts the low three bytes in BASE0, with the
+        // most significant byte in the address prefix.
+        self.registers
+            .base0
+            .set((params.access_address & 0x00FF_FFFF) << 8);
+        self.registers
+            .prefix0
+            .set((params.access_address >> 24) & 0xFF);
+
+        self.registers
+            .crccnf
+            .write(CrcConfiguration::LEN::THREE + CrcConfiguration::SKIPADDR::EXCLUDE);
+        self.registers
+            .crcpoly
+            .set(nrf5x::constants::RADIO_CRCPOLY_BLE);
+        self.registers
+            .crcinit
+            .write(CrcInitialValue::CRCINIT.val(params.crc_init));
+
+        // Hardware enforces the inter-frame space on the receive-to-transmit
+        // turnaround, which is what makes the 150 us deadline achievable.
+        self.registers
+            .tifs
+            .write(InterFrameSpacing::TIFS.val(T_IFS_US));
+
+        self.registers.mode.write(Mode::MODE::BLE_1MBIT);
+        self.registers.pcnf0.write(
+            PacketConfiguration0::LFLEN.val(8)
+                + PacketConfiguration0::S0LEN.val(1)
+                + PacketConfiguration0::S1LEN::CLEAR
+                + PacketConfiguration0::S1INCL::CLEAR
+                + PacketConfiguration0::PLEN::EIGHT,
+        );
+        self.registers.pcnf1.write(
+            PacketConfiguration1::WHITEEN::ENABLED
+                + PacketConfiguration1::ENDIAN::LITTLE
+                + PacketConfiguration1::BALEN.val(3)
+                + PacketConfiguration1::STATLEN::CLEAR
+                + PacketConfiguration1::MAXLEN.val(255),
+        );
+        self.registers
+            .txaddress
+            .write(TransmitAddress::ADDRESS.val(0));
+        self.registers
+            .rxaddresses
+            .write(ReceiveAddresses::ADDRESS.val(1));
+
+        self.set_tx_power();
+        self.ble_set_channel_freq(channel);
+        self.ble_set_data_whitening(channel);
+        self.set_dma_ptr();
+    }
 }
 
 impl<'a> ble_advertising::BleAdvertisementDriver<'a> for Radio<'a> {
@@ -751,6 +1069,10 @@ impl<'a> ble_advertising::BleAdvertisementDriver<'a> for Radio<'a> {
     fn set_transmit_client(&self, client: &'a dyn ble_advertising::TxClient) {
         self.tx_client.set(client);
     }
+
+    fn stop_receive(&self) {
+        self.radio_off();
+    }
 }
 
 impl ble_advertising::BleConfig for Radio<'_> {
@@ -767,5 +1089,92 @@ impl ble_advertising::BleConfig for Radio<'_> {
                 Ok(())
             }
         }
+    }
+}
+
+impl Time for Radio<'_> {
+    type Frequency = Freq1MHz;
+    type Ticks = Ticks32;
+
+    /// The connection event clock.
+    ///
+    /// Reads zero until [`BleConnectionDriver::connection_configure`] starts
+    /// the timer.
+    fn now(&self) -> Ticks32 {
+        // Capturing latches the running counter into a compare register, which
+        // is the only way to read it.
+        self.timer.tasks_capture[CC_NOW].set(1);
+        Ticks32::from(self.timer.cc[CC_NOW].get())
+    }
+}
+
+impl<'a> BleConnectionDriver<'a> for Radio<'a> {
+    fn connection_configure(&self, params: &ConnectionParams) -> Result<(), ErrorCode> {
+        self.conn_params.set(Some(*params));
+        self.conn_sn.set(0);
+        self.conn_nesn.set(0);
+        self.conn_tx_acked.set(false);
+
+        self.connection_timer_init();
+
+        // Route the receive window deadline to the radio's disable task, so an
+        // event ends even if the central is never heard.
+        self.ppi.configure(
+            PPI_CH_WINDOW_TIMEOUT,
+            self.timer_compare_event_address(CC_WINDOW_TIMEOUT),
+            self.radio_disable_task_address(),
+        )
+    }
+
+    fn connection_event_start(
+        &self,
+        channel: RadioChannel,
+        tx_buf: &'static mut [u8],
+        open_time: Ticks32,
+        pdu: TxPdu,
+    ) -> Result<(), (ErrorCode, &'static mut [u8])> {
+        if self.conn_phase.get() != ConnPhase::Idle {
+            return Err((ErrorCode::BUSY, tx_buf));
+        }
+        let Some(params) = self.conn_params.get() else {
+            return Err((ErrorCode::OFF, tx_buf));
+        };
+
+        self.conn_tx_buf.replace(tx_buf);
+        self.conn_rx_ok.set(false);
+        self.conn_tx_acked.set(false);
+        self.conn_tx_pdu.set(pdu);
+
+        // Power-cycling clears every radio register, so the whole packet
+        // configuration is reapplied for each event.
+        self.radio_on();
+        self.configure_connection_radio(&params, channel);
+
+        // READY_START starts the radio once it has ramped up, END_DISABLE ends
+        // the packet, and DISABLED_TXEN turns the end of the reception into the
+        // start of the reply without software involvement.
+        self.registers.shorts.write(
+            Shortcut::READY_START::SET + Shortcut::END_DISABLE::SET + Shortcut::DISABLED_TXEN::SET,
+        );
+
+        let open = open_time.into_u32();
+        self.timer.events_compare[CC_OPEN_TIME].set(0);
+        self.timer.events_compare[CC_WINDOW_TIMEOUT].set(0);
+        self.timer.cc[CC_OPEN_TIME].set(open);
+        self.timer.cc[CC_WINDOW_TIMEOUT].set(open.wrapping_add(RX_WINDOW_TIMEOUT_US));
+
+        self.ppi
+            .enable(Channel::CH0::SET + Channel::CH21::SET + Channel::CH26::SET);
+
+        self.registers
+            .intenset
+            .write(Interrupt::END::SET + Interrupt::DISABLED::SET);
+        self.conn_phase.set(ConnPhase::Rx);
+
+        Ok(())
+    }
+
+    fn set_connection_event_client(&self, client: &'a dyn ConnectionEventClient<Ticks32>) {
+        self.conn_client.set(client);
     }
 }

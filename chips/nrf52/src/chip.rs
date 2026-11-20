@@ -58,6 +58,9 @@ const TEMP_BASE: StaticRef<crate::temperature::TempRegisters> =
 const TIMER0_BASE: StaticRef<crate::timer::TimerRegisters> =
     unsafe { StaticRef::new(0x40008000 as *const crate::timer::TimerRegisters) };
 
+const PPI_BASE: StaticRef<crate::ppi::PpiRegisters> =
+    unsafe { StaticRef::new(0x4001F000 as *const crate::ppi::PpiRegisters) };
+
 const TIMER1_BASE: StaticRef<crate::timer::TimerRegisters> =
     unsafe { StaticRef::new(0x40009000 as *const crate::timer::TimerRegisters) };
 
@@ -145,7 +148,13 @@ impl<'a> Nrf52DefaultPeripherals<'a> {
             acomp: crate::acomp::Comparator::new(COMP_BASE),
             ecb: crate::aes::AesECB::new(aes_registers, aes_ecb_buffer),
             pwr_clk: crate::power::Power::new(POWER_BASE),
-            ble_radio: crate::ble_radio::Radio::new(RADIO_BASE),
+            // The BLE radio drives TIMER0 directly for connection event
+            // timing, because PPI channels 21 and 26 are hardwired to it.
+            // This is sound only because BLE and 802.15.4 cannot both be in
+            // use: they are two views of the same radio peripheral, and a
+            // board must bring up one or the other. See
+            // `doc/reference/trd-ble-connection.md`.
+            ble_radio: crate::ble_radio::Radio::new(RADIO_BASE, TIMER0_BASE, PPI_BASE),
             trng: crate::trng::Trng::new(RNG_BASE),
             rtc: crate::rtc::Rtc::new(RTC1_BASE),
             temp: crate::temperature::Temp::new(TEMP_BASE),
