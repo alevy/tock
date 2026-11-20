@@ -204,6 +204,20 @@ pub enum BitmodeValue {
     Size32Bits = 3,
 }
 
+/// One of a timer's four capture/compare registers.
+///
+/// Which register a job uses matters on this chip: several pre-programmed PPI
+/// channels are wired to specific compare and capture indices, so a caller
+/// driving the timer through PPI has to name the register, not just a
+/// deadline.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CaptureCompare {
+    Cc0 = 0,
+    Cc1 = 1,
+    Cc2 = 2,
+    Cc3 = 3,
+}
+
 pub trait CompareClient {
     /// Passes a bitmask of which of the 4 compares/captures fired (0x0-0xf).
     fn compare(&self, bitmask: u8);
@@ -224,6 +238,57 @@ impl Timer {
 
     pub fn set_client(&self, client: &'static dyn CompareClient) {
         self.client.set(client);
+    }
+
+    /// Stop the timer, apply `prescaler` and `bitmode`, and start it from zero.
+    ///
+    /// The counter ticks at 16 MHz shifted right by `prescaler`, so a
+    /// prescaler of 4 gives a one microsecond tick. Only prescaler values 0
+    /// through 9 are defined.
+    pub fn start(&self, prescaler: u32, bitmode: BitmodeValue) {
+        self.registers.tasks_stop.write(Task::ENABLE::SET);
+        self.registers.prescaler.set(prescaler);
+        self.registers
+            .bitmode
+            .write(Bitmode::BITMODE.val(bitmode as u32));
+        self.registers.tasks_clear.write(Task::ENABLE::SET);
+        self.registers.tasks_start.write(Task::ENABLE::SET);
+    }
+
+    /// Stop the timer, leaving the counter where it is.
+    pub fn stop(&self) {
+        self.registers.tasks_stop.write(Task::ENABLE::SET);
+    }
+
+    /// Set the value `cc` compares the counter against.
+    pub fn set_compare(&self, cc: CaptureCompare, value: u32) {
+        self.registers.cc[cc as usize].set(value);
+    }
+
+    /// Read `cc` without disturbing it.
+    ///
+    /// Distinct from [`Timer::capture`]: a capture/compare register may have
+    /// been stamped with the counter by hardware, over PPI, and this reads
+    /// that value back rather than overwriting it with a fresh one.
+    pub fn compare_value(&self, cc: CaptureCompare) -> u32 {
+        self.registers.cc[cc as usize].get()
+    }
+
+    /// Clear the compare event for `cc`.
+    ///
+    /// A compare event stays set until cleared, and while set it cannot
+    /// trigger a PPI channel again. Clear it before arming a new deadline.
+    pub fn clear_compare_event(&self, cc: CaptureCompare) {
+        self.registers.events_compare[cc as usize].write(Event::READY::CLEAR);
+    }
+
+    /// Capture the counter into `cc` and return it.
+    ///
+    /// This overwrites `cc`, so do not use it on a register that is holding a
+    /// deadline or a value captured by hardware.
+    pub fn capture(&self, cc: CaptureCompare) -> u32 {
+        self.registers.tasks_capture[cc as usize].write(Task::ENABLE::SET);
+        self.registers.cc[cc as usize].get()
     }
 
     /// When an interrupt occurs, check if any of the 4 compares have

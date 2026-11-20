@@ -58,6 +58,17 @@ pub trait BleAdvertisementDriver<'a> {
     fn receive_advertisement(&self, channel: RadioChannel);
     fn set_receive_client(&self, client: &'a dyn RxClient);
     fn set_transmit_client(&self, client: &'a dyn TxClient);
+
+    /// Abort a receive started by `receive_advertisement`.
+    ///
+    /// No `RxClient::receive_event` callback fires for the aborted receive.
+    /// Needed by a connectable advertiser, which listens for a `CONNECT_IND`
+    /// after each advertisement and must stop listening when it moves on to the
+    /// next channel.
+    ///
+    /// The default implementation does nothing, for drivers that do not support
+    /// connectable advertising.
+    fn stop_receive(&self) {}
 }
 
 pub trait BleConfig {
@@ -117,7 +128,58 @@ pub enum RadioChannel {
     AdvertisingChannel39 = 80,
 }
 
+/// The 37 data channels, indexed by data channel index.
+///
+/// Channel selection (Bluetooth Core Specification, Vol 6, Part B, §4.5.8)
+/// produces an index, which this table maps to the corresponding variant. The
+/// enum's discriminants are radio frequency offsets, not channel indices, so
+/// the mapping cannot be arithmetic.
+const DATA_CHANNELS: [RadioChannel; 37] = [
+    RadioChannel::DataChannel0,
+    RadioChannel::DataChannel1,
+    RadioChannel::DataChannel2,
+    RadioChannel::DataChannel3,
+    RadioChannel::DataChannel4,
+    RadioChannel::DataChannel5,
+    RadioChannel::DataChannel6,
+    RadioChannel::DataChannel7,
+    RadioChannel::DataChannel8,
+    RadioChannel::DataChannel9,
+    RadioChannel::DataChannel10,
+    RadioChannel::DataChannel11,
+    RadioChannel::DataChannel12,
+    RadioChannel::DataChannel13,
+    RadioChannel::DataChannel14,
+    RadioChannel::DataChannel15,
+    RadioChannel::DataChannel16,
+    RadioChannel::DataChannel17,
+    RadioChannel::DataChannel18,
+    RadioChannel::DataChannel19,
+    RadioChannel::DataChannel20,
+    RadioChannel::DataChannel21,
+    RadioChannel::DataChannel22,
+    RadioChannel::DataChannel23,
+    RadioChannel::DataChannel24,
+    RadioChannel::DataChannel25,
+    RadioChannel::DataChannel26,
+    RadioChannel::DataChannel27,
+    RadioChannel::DataChannel28,
+    RadioChannel::DataChannel29,
+    RadioChannel::DataChannel30,
+    RadioChannel::DataChannel31,
+    RadioChannel::DataChannel32,
+    RadioChannel::DataChannel33,
+    RadioChannel::DataChannel34,
+    RadioChannel::DataChannel35,
+    RadioChannel::DataChannel36,
+];
+
 impl RadioChannel {
+    /// Returns the data channel with the given index, or `None` if `index` is
+    /// not in the range 0..=36.
+    pub fn from_data_channel_index(index: u8) -> Option<RadioChannel> {
+        DATA_CHANNELS.get(index as usize).copied()
+    }
     pub fn get_channel_index(&self) -> u32 {
         match *self {
             RadioChannel::DataChannel0 => 0,
